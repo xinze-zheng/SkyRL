@@ -32,12 +32,11 @@ import os
 import sys
 from typing import Any
 
-from transformers import AutoTokenizer
-
 from minisweagent.exceptions import FormatError
 from minisweagent.models.litellm_tito_model import LitellmTITOModel
 from minisweagent.models.utils.actions_toolcall import BASH_TOOL
-
+from minisweagent.models.utils.chat_templates import resolve_chat_template
+from transformers import AutoTokenizer
 
 SYS = (
     "You are a shell assistant. For every user request you MUST call the "
@@ -119,6 +118,7 @@ def main() -> None:
     print(f"   base_url: {args.base_url}")
 
     tok = AutoTokenizer.from_pretrained(args.model_id)
+    chat_template = resolve_chat_template(model_name=f"openai/{args.model_id}")
 
     model = LitellmTITOModel(
         model_name=f"openai/{args.model_id}",
@@ -137,8 +137,8 @@ def main() -> None:
     ]
     m1, fmt_err1 = _query_capturing_format_error(model, msgs1)
     if fmt_err1:
-        print(f"   NOTE: model produced no tool call (FormatError). "
-              f"Verifying TITO capture only.")
+        print("   NOTE: model produced no tool call (FormatError). "
+              "Verifying TITO capture only.")
 
     extra1 = m1.get("extra") or {}
     tito1 = extra1.get("tito") or {}
@@ -217,8 +217,8 @@ def main() -> None:
     msgs2 = msgs1 + [asst_for_history, obs]
     m2, fmt_err2 = _query_capturing_format_error(model, msgs2)
     if fmt_err2:
-        print(f"   NOTE: step-2 model also produced no tool call. "
-              f"Capture-only validation continues.")
+        print("   NOTE: step-2 model also produced no tool call. "
+              "Capture-only validation continues.")
 
     extra2 = m2.get("extra") or {}
     tito2 = extra2.get("tito") or {}
@@ -248,6 +248,7 @@ def main() -> None:
         tools=[BASH_TOOL],
         add_generation_prompt=True,
         tokenize=False,
+        chat_template=chat_template,
     )
     prompt2_ids = tok.encode(prompt2_text, add_special_tokens=False)
     print(f"   local-rendered step-2 prompt: {_fmt_ids(prompt2_ids)}")
@@ -260,6 +261,7 @@ def main() -> None:
         tools=[BASH_TOOL],
         add_generation_prompt=True,
         tokenize=False,
+        chat_template=chat_template,
     )
     prompt1_ids = tok.encode(prompt1_text, add_special_tokens=False)
 
@@ -267,7 +269,7 @@ def main() -> None:
            "(g.1) step-2 prompt is strictly longer than step-1 prompt",
            f"{len(prompt1_ids)} -> {len(prompt2_ids)}")
     _check(prompt2_ids[: len(prompt1_ids)] == prompt1_ids,
-           "(g.2) step-2 prompt extends step-1 prompt as a strict prefix",
+           "(g.2) local chat template preserves the step-1 prefix",
            "first divergence at "
            f"{next((i for i in range(len(prompt1_ids)) if prompt2_ids[i] != prompt1_ids[i]), 'n/a')}")
 

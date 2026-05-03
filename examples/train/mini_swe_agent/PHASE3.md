@@ -24,7 +24,8 @@ already cached.
 | `tokens / loss_mask / logprobs lengths match n_tokens` | Three parallel arrays stay aligned through `absorb_step` |
 | `sum(loss_mask) == n_gen` | All sampled tokens are labelled `1`; everything else `0` |
 | `prompt region is fully masked-out` | Initial system+user prompt has no train-on labels |
-| `step k prompt extends step k-1 prompt+output` | The strict-prefix invariant the agent uses to extract observation deltas |
+| `transition observation_token_ids recorded` | Later-turn observations are tracked by fixed-base local tokenization |
+| `tokens/loss_mask/logprobs reconstruct from transitions` | Saved arrays match `initial prompt + observation_token_ids + output_token_ids` |
 | `payload prompt_len / tokens / logprobs match saved JSON` | Generator-bound payload is consistent with what was persisted |
 
 A failure on **any** check tells you specifically which layer drifted.
@@ -62,6 +63,7 @@ CUDA_VISIBLE_DEVICES=<idle GPU> nohup uv run vllm serve Qwen/Qwen3-1.7B \
     --enable-auto-tool-choice \
     --tool-call-parser hermes \
     --reasoning-parser qwen3 \
+    --trust-request-chat-template \
     --gpu-memory-utilization 0.3 \
     > /tmp/vllm-phase3.log 2>&1 &
 
@@ -99,7 +101,8 @@ Useful flags:
   inspection instead of writing to a tmpdir.
 - `--max-tokens 256` — shorter per-call generation; fastest mode.
 - `--step-limit 1` — collapses to "did one model call succeed and get
-  recorded?". Skips the multi-turn prefix-invariant checks.
+  recorded?". Multi-turn reconstruction checks still run when more than one
+  step is recorded.
 
 ### Expected output (success)
 
@@ -120,8 +123,10 @@ Useful flags:
   [PASS] logprobs array length matches n_tokens
   [PASS] sum(loss_mask) == n_gen
   [PASS] prompt region is fully masked-out (all 0s)
-  [PASS] step 1 prompt extends step 0 prompt+output
-  ...
+  [PASS] transition observation_token_ids recorded
+  [PASS] tokens reconstruct from prompt + observations + outputs
+  [PASS] loss_mask reconstructs from transition boundaries
+  [PASS] logprobs reconstruct from output logprobs and observation padding
    model class in saved config: minisweagent.models.litellm_tito_model.LitellmTITOModel
   [PASS] tito_payload returned from Ray task
   [PASS] payload prompt_len matches saved JSON
@@ -138,46 +143,26 @@ inspection.
 
 ## Known failure modes
 
-### A. `TITO prefix invariant violated at step k` (Qwen3-only, by design)
+### A. `Chat template is passed with request, but --trust-request-chat-template is not set`
 
-The agent's `TITOAgentState.absorb_step` raises if the next-turn prompt
-does NOT extend `(prev_prompt + prev_output)` byte-for-byte. With
-**Qwen3 + `/v1/chat/completions`** this fires reliably around step 2-3
-because Qwen3's chat template **strips `<think>...</think>` blocks from
-non-final assistant turns** when re-rendering the conversation. The
-template is position-dependent: thinking is preserved on the *current*
-assistant turn but removed from earlier ones.
+`LitellmTITOModel` sends the SkyRL-compatible Qwen3 chat template in the
+request so vLLM does not strip prior thinking content while rendering chat
+history. Restart vLLM with:
 
-This is **not data corruption** — the tokens we recorded are exactly what
-vLLM sampled, including the thinking. The mismatch is between the
-*recorded* assistant span and the *re-rendered* assistant span, not
-between the model's true output and our captured tokens.
+```bash
+--trust-request-chat-template
+```
 
-For RL training, we **want** to keep the thinking tokens with `mask=1`
-and real logprobs: that's the whole point of training a reasoning model.
-The next-turn context-distribution shift (model thought during sampling
-but sees no thinking in older turns at inference time) is a separate
-training-vs-inference issue handled by the model itself, not by removing
-tokens from the training stream.
+### B. Prefix-invariant failures in older scripts
 
-If you hit this:
+The old prefix-invariant test is obsolete for fixed-base TITO. The current
+Phase 3 smoke reconstructs the saved arrays from
+`prompt_token_ids + observation_token_ids + output_token_ids` instead. If an
+older helper still checks that each vLLM-rendered prompt extends the previous
+prompt and output byte-for-byte, treat it as diagnostic only, not a correctness
+gate.
 
-1. Confirm it's the Qwen3 thinking-strip by inspecting `transitions[k]`
-   in the trajectory JSON: `prev_output` should start with token IDs
-   `[151667, 198, 151668, ...]` (`<think>`, `\n`, `</think>`, ...) which
-   are absent from `transitions[k+1].prompt_token_ids`.
-2. The recorded `tokens / loss_mask / logprobs` arrays are still correct
-   for training. The error is from the safety assert.
-3. The proper fix (planned) is one of:
-   - Switch `LitellmTITOModel` to `/v1/completions` and have the agent
-     own the prompt as a token array end-to-end (no chat-template
-     re-render between turns).
-   - Relax the assert: trust the recorded tokens, accept context drift,
-     and locate observation tokens by anchor-matching the generation
-     prompt suffix at the end of `new_prompt` instead of by prefix
-     equality.
-
-### B. `Completions.create() got an unexpected keyword argument '...'`
+### C. `Completions.create() got an unexpected keyword argument '...'`
 
 `LitellmTITOModel` bypasses litellm and talks to the OpenAI SDK directly;
 some YAML config keys are litellm-only and must be filtered. The model
@@ -185,19 +170,19 @@ class already strips a known list (`drop_params`, `num_retries`,
 `api_base`, etc.). If a new one slips through, add it to
 `LitellmTITOModel._LITELLM_ONLY_KWARGS`.
 
-### C. `Free memory on device cuda:0 ... is less than desired`
+### D. `Free memory on device cuda:0 ... is less than desired`
 
 Another process holds the GPU. Choose a different one
 (`CUDA_VISIBLE_DEVICES=N`) or stop the existing user (`ray stop --force`,
 then verify with `nvidia-smi --query-compute-apps=pid,used_memory --format=csv`).
 
-### D. `error: unrecognized input` (in eval, not in TITO)
+### E. `error: unrecognized input` (in eval, not in TITO)
 
 The generated patch was empty or malformed; `git apply` then `bash`
 rejects it. This is a model-quality issue, not a TITO bug. Ignore for
 the purposes of this smoke test — TITO checks still run.
 
-### E. Trajectory written but `n_steps == 0`
+### F. Trajectory written but `n_steps == 0`
 
 The agent failed *before* the first model call could complete (e.g.,
 model auth error, vLLM unreachable). Check:
@@ -225,9 +210,8 @@ the recorded output to match what vLLM re-renders next turn (i.e. drop
   *prompt-rendering* concern, not a *what-to-train-on* concern. They are
   two different layers and should stay separate.
 
-The strict prefix assert in `TITOAgentState` exists to protect against
-*silent* drift between the recorded tokens and what the next prompt
-contains — without it, observation deltas would be miscomputed. It's
-intentionally loud so you notice when the layers diverge. The fix is to
-change how observation deltas are extracted, not to hide the thinking
-tokens.
+Fixed-base TITO keeps these layers separate: sampled assistant tokens come
+from vLLM, while later observation tokens are computed locally from a small
+fixed-base conversation. This is why the Phase 3 smoke now validates array
+reconstruction from transitions instead of cross-turn vLLM prompt prefix
+equality.

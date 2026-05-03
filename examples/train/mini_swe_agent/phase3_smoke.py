@@ -1,3 +1,4 @@
+# ruff: noqa: E402, I001
 """Phase 3 smoke test for TITO bookkeeping.
 
 Drives mini-swe-agent through ONE SWE-Gym instance with TITO enabled, then
@@ -97,6 +98,35 @@ class _Checker:
             self.failures.append(label + (f": {detail}" if detail else ""))
 
 
+def _rebuild_tito_arrays(tito: dict) -> tuple[list[int], list[int], list[float]]:
+    transitions = tito["transitions"]
+    if not transitions:
+        return [], [], []
+
+    rebuilt_tokens = list(transitions[0]["prompt_token_ids"])
+    rebuilt_mask = [0] * len(rebuilt_tokens)
+    rebuilt_logprobs = [0.0] * len(rebuilt_tokens)
+    for i, transition in enumerate(transitions):
+        obs_ids = list(transition.get("observation_token_ids") or [])
+        if i > 0:
+            rebuilt_tokens.extend(obs_ids)
+            rebuilt_mask.extend([0] * len(obs_ids))
+            rebuilt_logprobs.extend([0.0] * len(obs_ids))
+
+        output_ids = list(transition["output_token_ids"])
+        output_logprobs = list(transition.get("output_logprobs") or [])
+        if len(output_logprobs) < len(output_ids):
+            output_logprobs.extend([0.0] * (len(output_ids) - len(output_logprobs)))
+        elif len(output_logprobs) > len(output_ids):
+            output_logprobs = output_logprobs[: len(output_ids)]
+
+        rebuilt_tokens.extend(output_ids)
+        rebuilt_mask.extend([1] * len(output_ids))
+        rebuilt_logprobs.extend(output_logprobs)
+
+    return rebuilt_tokens, rebuilt_mask, rebuilt_logprobs
+
+
 # ----------------------------------------------------------------------
 # Main
 # ----------------------------------------------------------------------
@@ -145,6 +175,9 @@ def main() -> int:
     payload = _load_instance(args.parquet, args.instance_id)
     print(f"== Phase 3 smoke for {payload['instance_id']}")
     print(f"   model: {args.model_id}    base_url: {args.base_url}")
+    print("="*50)
+    print(payload)
+    print("="*50)
 
     sweagent_config = yaml.safe_load(Path(args.config_path).read_text())
     sweagent_config.setdefault("agent", {})["step_limit"] = args.step_limit
@@ -233,13 +266,24 @@ def main() -> int:
               "prompt region is fully masked-out (all 0s)")
 
     transitions = tito["transitions"]
-    for i in range(1, len(transitions)):
-        prev = transitions[i - 1]
-        cur = transitions[i]
-        expected_prefix = prev["prompt_token_ids"] + prev["output_token_ids"]
+    chk.check(
+        all("observation_token_ids" in t for t in transitions),
+        "transition observation_token_ids recorded",
+    )
+    if transitions:
+        rebuilt_tokens, rebuilt_mask, rebuilt_logprobs = _rebuild_tito_arrays(tito)
+
         chk.check(
-            cur["prompt_token_ids"][: len(expected_prefix)] == expected_prefix,
-            f"step {i} prompt extends step {i-1} prompt+output",
+            rebuilt_tokens == tito["tokens"],
+            "tokens reconstruct from prompt + observations + outputs",
+        )
+        chk.check(
+            rebuilt_mask == tito["loss_mask"],
+            "loss_mask reconstructs from transition boundaries",
+        )
+        chk.check(
+            rebuilt_logprobs == tito["logprobs"],
+            "logprobs reconstruct from output logprobs and observation padding",
         )
 
     print(f"\n   model class in saved config: "
