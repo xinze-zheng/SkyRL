@@ -162,7 +162,7 @@ class MiniSweAgentGenerator(SkyRLGymGenerator):
         self,
         generator_cfg: GeneratorConfig,
         skyrl_gym_cfg: SkyRLGymConfig,
-        inference_engine_client: InferenceEngineClient,
+        inference_engine_client: Union[InferenceEngineClient, RemoteInferenceClient],
         tokenizer,
         model_name: str,
     ):
