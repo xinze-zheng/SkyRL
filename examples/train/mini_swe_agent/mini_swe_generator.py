@@ -30,6 +30,7 @@ class MiniSWEGeneratorConfig(GeneratorConfig):
 
     miniswe_config_path: str = ""
     miniswe_traj_dir: str = ""
+    use_tito_proxy: bool = False
 
 
 class DefaultAgentWithReminder(DefaultAgent):
@@ -66,12 +67,10 @@ class DefaultAgentWithReminder(DefaultAgent):
 
         try:
             ret = super().step()
-            print(ret)
             return ret
         except FormatError as e:
             # Preserve the raw assistant response that failed parsing
             raw_msg = getattr(self.model, '_last_raw_message', None)
-            print(f"FormatError encountered. Stashing raw message for debugging: {raw_msg}")
             if raw_msg and not any(m is raw_msg for m in self.messages):
                 raw_msg.setdefault("extra", {})["format_error"] = True
                 self.add_messages(raw_msg)
@@ -162,7 +161,7 @@ class MiniSweAgentGenerator(SkyRLGymGenerator):
         self,
         generator_cfg: GeneratorConfig,
         skyrl_gym_cfg: SkyRLGymConfig,
-        inference_engine_client: Union[InferenceEngineClient, RemoteInferenceClient],
+        inference_engine_client: Tuple[InferenceEngineClient, RemoteInferenceClient],
         tokenizer,
         model_name: str,
     ):
@@ -180,11 +179,30 @@ class MiniSweAgentGenerator(SkyRLGymGenerator):
             from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import RemoteInferenceClient
 
             if isinstance(inference_engine_client, RemoteInferenceClient):
-                self.base_url = inference_engine_client.proxy_url + "/v1"
+                backend_url = inference_engine_client.proxy_url
             else:
-                self.base_url = f"http://{self.http_server_inference_engine_client_host}:{self.http_server_inference_engine_client_port}/v1"
+                backend_url = f"http://{self.http_server_inference_engine_client_host}:{self.http_server_inference_engine_client_port}"
         except ImportError:
-            self.base_url = f"http://{self.http_server_inference_engine_client_host}:{self.http_server_inference_engine_client_port}/v1"
+            backend_url = f"http://{self.http_server_inference_engine_client_host}:{self.http_server_inference_engine_client_port}"
+
+        # Optionally start a TITO proxy between litellm and the vLLM router.
+        # When enabled, init_and_run tasks hit the proxy, which can intercept
+        # and convert chat completions to token-in-token-out calls.
+        # Each rollout gets a unique URL: http://proxy:PORT/session/{id}/v1
+        self._tito_proxy = None
+        if getattr(generator_cfg, "use_tito_proxy", False):
+            from .tito_proxy import TITOProxy
+
+            self._tito_proxy = TITOProxy(
+                backend_url=backend_url,
+                log_path=getattr(generator_cfg, "miniswe_traj_dir", None),
+            )
+            self._tito_proxy.start()
+            # base_url is set per-rollout in minisweagent_agent_loop via session_url()
+            self.base_url = None
+        else:
+            self.base_url = backend_url + "/v1"
+
         self.generator_cfg = generator_cfg
         self.tokenizer = tokenizer
         self.model_name = model_name
@@ -192,6 +210,15 @@ class MiniSweAgentGenerator(SkyRLGymGenerator):
 
         if self.generator_cfg.chat_template.name_or_path is not None:
             raise NotImplementedError("MiniSWEAgentGenerator doesn't support custom chat template")
+
+        # Load custom chat template for training-side tokenization so it
+        # matches the vLLM engine's template (e.g. qwen3_acc_thinking.jinja2).
+        self._tokenizer_kwargs: Dict[str, Any] = {}
+        chat_template_path = generator_cfg.inference_engine.engine_init_kwargs.get("chat_template")
+        if chat_template_path:
+            tpl_path = Path(chat_template_path)
+            if tpl_path.exists():
+                self._tokenizer_kwargs["chat_template"] = tpl_path.read_text()
 
     async def minisweagent_agent_loop(
         self,
@@ -205,6 +232,15 @@ class MiniSweAgentGenerator(SkyRLGymGenerator):
     ) -> Tuple[List[int], float, str, List[int], List[int], Optional[List[int]]]:
 
         sweagent_config = yaml.safe_load(get_config_path(self.generator_cfg.miniswe_config_path).read_text())
+
+        # Construct per-rollout base_url: when TITO proxy is active, each
+        # rollout gets a unique URL with the session ID in the path.
+        if self._tito_proxy is not None:
+            session_id = f"{trajectory_id.instance_id}_{trajectory_id.repetition_id}_{batch_metadata.global_step}"
+            rollout_base_url = self._tito_proxy.session_url(session_id)
+        else:
+            rollout_base_url = self.base_url
+
         # NOTE (sumanthrh): Input `prompt` is not used here because mini-swe-agent uses a similar entry from the `instance` obj
         messages, reward, error = await init_and_run.remote(
             env_extras["instance"],
@@ -216,7 +252,7 @@ class MiniSweAgentGenerator(SkyRLGymGenerator):
             trajectory_id,
             batch_metadata.global_step,
             batch_metadata.training_phase,
-            self.base_url,
+            rollout_base_url,
         )
         if not len(messages):
             return None, None, None, None, None, None
@@ -231,7 +267,8 @@ class MiniSweAgentGenerator(SkyRLGymGenerator):
             ), "Expected the first two messages to be system and user messages"
 
         initial_input_ids = self.tokenizer.apply_chat_template(
-            messages[:2], add_generation_prompt=False, return_dict=False, tokenize=True
+            messages[:2], add_generation_prompt=False, return_dict=False, tokenize=True,
+            **self._tokenizer_kwargs,
         )
         initial_prompt_length = len(initial_input_ids)
 
@@ -258,6 +295,7 @@ class MiniSweAgentGenerator(SkyRLGymGenerator):
             response_messages,
             self.tokenizer,
             assistant_logprobs=None,
+            tokenizer_kwargs=self._tokenizer_kwargs,
         )
 
         # Extract prompt ids

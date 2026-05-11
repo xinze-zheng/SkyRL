@@ -16,7 +16,7 @@ NUM_GPUS=8
 NNODES=1
 NUM_INFERENCE_ENGINES=4
 TP_SIZE=2
-LOGGER=wandb
+LOGGER=console
 
 # We use a small batch size here for demonstration
 # NOTE (sumanthrh): The `generator.max_turns` here is actually unused, and we use the `step_limit` from the `swebench.yaml` file. 
@@ -67,6 +67,6 @@ uv run --isolated --extra fsdp --extra miniswe --env-file examples/train/mini_sw
   trainer.run_name="mini_swe_8B_swe_gym" \
   trainer.resume_mode=null \
   trainer.ckpt_path="$CKPT_PATH" \
-  generator.miniswe_config_path="examples/mini_swe_agent/swebench.yaml" \
+  generator.miniswe_config_path="examples/train/mini_swe_agent/swebench.yaml" \
   generator.miniswe_traj_dir=$MINISWE_TRAJ_DIR
   $@
