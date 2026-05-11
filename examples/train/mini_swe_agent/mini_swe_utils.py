@@ -27,7 +27,7 @@ def get_sb_environment(config: dict, instance: dict, data_source: str) -> Enviro
     env = get_environment(env_config)
     if startup_command := config.get("run", {}).get("env_startup_command"):
         startup_command = Template(startup_command).render(**instance)
-        out = env.execute(startup_command)
+        out = env.execute({"command": startup_command})
         if out["returncode"] != 0:
             raise RuntimeError(f"Error executing startup command: {out}")
     return env
@@ -71,7 +71,7 @@ def evaluate_trajectory(
     delimiter = f"PATCH_{uuid.uuid4().hex}"  # unlikely to collide with symbols in the patch
     command = f"git apply <<'{delimiter}'\n{model_patch}\n{delimiter}"
 
-    obs = env.execute(command)
+    obs = env.execute({"command": command})
 
     if obs["returncode"] != 0:
         ret["eval_error"] = obs["output"]
@@ -80,7 +80,7 @@ def evaluate_trajectory(
         eval_script = instance["eval_script"]
         eval_cmd = f"bash <<'EOF'\n{eval_script}\nEOF"
         # add longer timeout for evaluation
-        obs = env.execute(eval_cmd, timeout=3600)
+        obs = env.execute({"command": eval_cmd}, timeout=3600)
         # use the return value
         ret["resolved"] = obs["returncode"] == 0
         # truncate to last 1000 characters for brevity

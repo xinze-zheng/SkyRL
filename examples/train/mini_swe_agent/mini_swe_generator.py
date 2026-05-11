@@ -8,7 +8,6 @@ from pathlib import Path
 
 from minisweagent.models import get_model
 from minisweagent.agents.default import DefaultAgent
-from minisweagent.run.utils.save import save_traj
 from minisweagent.config import get_config_path
 from .mini_swe_utils import evaluate_trajectory, get_sb_environment
 
@@ -17,6 +16,7 @@ from skyrl.train.generators.skyrl_gym_generator import SkyRLGymGenerator, Genera
 from skyrl.train.generators.base import TrajectoryID, TrainingPhase, BatchMetadata
 from skyrl.backends.skyrl_train.inference_engines.base import ConversationType
 from skyrl.backends.skyrl_train.inference_engines.inference_engine_client import InferenceEngineClient
+from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import RemoteInferenceClient
 from skyrl.backends.skyrl_train.inference_engines.utils import get_sampling_params_for_backend
 from skyrl.train.generators.utils import (
     get_rollout_metrics,
@@ -33,19 +33,49 @@ class MiniSWEGeneratorConfig(GeneratorConfig):
 
 
 class DefaultAgentWithReminder(DefaultAgent):
-    def get_observation(self, response: dict) -> dict:
-        """Execute the action and return the output."""
-        output = self.execute_action(self.parse_action(response))
-        observation = self.render_template(self.config.action_observation_template, output=output)
-        remaining = self.config.step_limit - self.model.n_calls
+    """Subclass that preserves raw assistant messages on FormatError.
 
-        if remaining == 1:
-            observation = f"{observation}\nREMINDER: You only have 1 turn left. Please provide the final answer"
-        elif remaining > 1:
-            observation = f"{observation}\nREMINDER: You have {remaining} turns left to arrive at the solution."
+    In upstream mini-swe-agent, if the model's response fails action parsing
+    (FormatError), the assistant message is never added to self.messages because
+    the exception is raised inside model.query() before the message is returned.
+    This override patches the model to always stash the raw response so it can
+    be recovered and saved in the trajectory for debugging.
+    """
 
-        self.add_message("user", observation)
-        return output
+    def __init__(self, model, env, **kwargs):
+        super().__init__(model, env, **kwargs)
+        self._patch_model_query()
+
+    def _patch_model_query(self):
+        """Wrap model._query to stash the raw response before parsing."""
+        original_inner_query = self.model._query
+
+        def patched_query(messages, **kwargs):
+            response = original_inner_query(messages, **kwargs)
+            # Stash raw assistant message so we can recover it on FormatError
+            try:
+                self.model._last_raw_message = response.choices[0].message.model_dump()
+            except Exception:
+                pass
+            return response
+
+        self.model._query = patched_query
+
+    def step(self) -> list[dict]:
+        from minisweagent.exceptions import FormatError
+
+        try:
+            ret = super().step()
+            print(ret)
+            return ret
+        except FormatError as e:
+            # Preserve the raw assistant response that failed parsing
+            raw_msg = getattr(self.model, '_last_raw_message', None)
+            print(f"FormatError encountered. Stashing raw message for debugging: {raw_msg}")
+            if raw_msg and not any(m is raw_msg for m in self.messages):
+                raw_msg.setdefault("extra", {})["format_error"] = True
+                self.add_messages(raw_msg)
+            raise
 
 
 @ray.remote(num_cpus=0.01)
@@ -59,13 +89,25 @@ def init_and_run(
     trajectory_id: TrajectoryID,
     global_step: int,
     training_phase: TrainingPhase,
+    base_url: str = None,
 ):
+    import os
+
     from loguru import logger
+
+    if base_url is not None:
+        os.environ["OPENAI_BASE_URL"] = base_url
 
     model_config = sweagent_config.get("model", {})
     # Use new sampling parameters
     # Can also have custom sampling parameters per trajectory (ex: custom max tokens)
-    model_config.setdefault("model_kwargs", {}).update(sampling_params)
+    # Convert integer logprobs to OpenAI chat completions format (boolean + top_logprobs)
+    sp = dict(sampling_params)
+    if isinstance(sp.get("logprobs"), int):
+        top_n = sp.pop("logprobs")
+        sp["logprobs"] = True
+        sp["top_logprobs"] = top_n
+    model_config.setdefault("model_kwargs", {}).update(sp)
     model = get_model(litellm_model_name, model_config)
 
     agent = None
@@ -77,7 +119,11 @@ def init_and_run(
     try:
         env = get_sb_environment(sweagent_config, instance, data_source)
         agent = DefaultAgentWithReminder(model, env, **sweagent_config.get("agent", {}))
-        exit_status, result = agent.run(instance["problem_statement"])  # type: ignore[arg-type]
+        # v2: agent.run() returns a dict with exit_status/submission keys
+        run_result = agent.run(instance["problem_statement"])  # type: ignore[arg-type]
+        print("Agent run result:", run_result)
+        exit_status = run_result.get("exit_status", "unknown")
+        result = run_result.get("submission", "")
     except Exception as e:
         logger.error(f"Error processing instance {instance['instance_id']}: {e}", exc_info=True)
         exit_status, result = type(e).__name__, str(e)
@@ -106,7 +152,7 @@ def init_and_run(
                 eval_error = str(e)
                 error = str(e)
 
-            save_traj(agent, path, exit_status=exit_status, result=result, extra_info=extra_info, reward=reward, eval_error=eval_error)  # type: ignore[arg-type]
+            agent.save(path, {"exit_status": exit_status, "result": result, "extra_info": extra_info, "reward": reward, "eval_error": eval_error})
 
     return (agent.messages if agent is not None else [], reward, error)
 
@@ -128,9 +174,17 @@ class MiniSweAgentGenerator(SkyRLGymGenerator):
 
         self.http_server_inference_engine_client_port = generator_cfg.inference_engine.http_endpoint_port
 
-        self.base_url = (
-            f"http://{self.http_server_inference_engine_client_host}:{self.http_server_inference_engine_client_port}"
-        )
+        # Use the inference server's dynamic URL when available (new inference server path),
+        # otherwise fall back to the legacy static host:port from config.
+        try:
+            from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import RemoteInferenceClient
+
+            if isinstance(inference_engine_client, RemoteInferenceClient):
+                self.base_url = inference_engine_client.proxy_url + "/v1"
+            else:
+                self.base_url = f"http://{self.http_server_inference_engine_client_host}:{self.http_server_inference_engine_client_port}/v1"
+        except ImportError:
+            self.base_url = f"http://{self.http_server_inference_engine_client_host}:{self.http_server_inference_engine_client_port}/v1"
         self.generator_cfg = generator_cfg
         self.tokenizer = tokenizer
         self.model_name = model_name
@@ -162,6 +216,7 @@ class MiniSweAgentGenerator(SkyRLGymGenerator):
             trajectory_id,
             batch_metadata.global_step,
             batch_metadata.training_phase,
+            self.base_url,
         )
         if not len(messages):
             return None, None, None, None, None, None
@@ -180,15 +235,24 @@ class MiniSweAgentGenerator(SkyRLGymGenerator):
         )
         initial_prompt_length = len(initial_input_ids)
 
-        # We remove trailing `user` messages - this is added by Mini-SWE-Agent to capture the final git diff for the trajectory
+        # We remove trailing `user` and `exit` messages - `exit` is added by mini-swe-agent v2, `user` captures the final git diff
         last_idx = len(response_messages) - 1
-        while response_messages[last_idx]["role"] == "user":
+        while last_idx >= 0 and response_messages[last_idx]["role"] in ("user", "exit"):
             last_idx -= 1
         if last_idx < 0:
-            raise ValueError(
-                "Found no assistant messages. Please ensure that your environment is configured correctly and the `OPENAI_BASE_URL` points to the HTTP server from the inference engine client"
-            )
+            # Agent exited with no assistant turns (e.g. LLM error on first call) — treat as failed rollout
+            from loguru import logger as _logger
+            _logger.warning(f"No assistant messages found in trajectory (error={error}). Treating as failed rollout.")
+            return None, None, None, None, None, None
         response_messages = response_messages[: last_idx + 1]
+
+        # Normalize roles for get_response_ids_and_loss_mask_from_messages,
+        # which only handles 'user' and 'assistant'. Tool-call results ('tool')
+        # and format-error messages are environment observations — treat as 'user'.
+        response_messages = [
+            {**msg, "role": "user"} if msg["role"] not in ("user", "assistant") else msg
+            for msg in response_messages
+        ]
 
         response_ids, loss_mask, _ = get_response_ids_and_loss_mask_from_messages(
             response_messages,
