@@ -247,9 +247,14 @@ def _build_chat_completion_response(
     prompt_tokens: int,
     completion_tokens: int,
     finish_reason: str = "stop",
+    logprobs_data: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
-    """Construct an OpenAI-compatible chat completion response."""
-    message: Dict[str, Any] = {"role": "assistant"}
+    """Construct an OpenAI-compatible chat completion response.
+
+    If ``logprobs_data`` is provided (from the completions response), it is
+    converted from the completions format to the chat completions format.
+    """
+    message: Dict[str, Any] = {"role": "assistant", "reasoning_content": None}
     if content is not None:
         message["content"] = content
     else:
@@ -257,6 +262,34 @@ def _build_chat_completion_response(
     if tool_calls:
         message["tool_calls"] = tool_calls
         finish_reason = "tool_calls"
+
+    # Convert completions logprobs to chat completions format
+    choice_logprobs = None
+    if logprobs_data:
+        tokens = logprobs_data.get("tokens", [])
+        token_logprobs = logprobs_data.get("token_logprobs", [])
+        top_logprobs_list = logprobs_data.get("top_logprobs", [])
+        lp_content = []
+        for i, token_str in enumerate(tokens):
+            entry: Dict[str, Any] = {
+                "token": token_str,
+                "logprob": token_logprobs[i] if i < len(token_logprobs) and token_logprobs[i] is not None else -9999.0,
+                "bytes": list(token_str.encode("utf-8", errors="replace")),
+            }
+            # Convert top_logprobs from {str: float} to [{token, logprob, bytes}]
+            if i < len(top_logprobs_list) and top_logprobs_list[i]:
+                entry["top_logprobs"] = [
+                    {
+                        "token": t,
+                        "logprob": lp,
+                        "bytes": list(t.encode("utf-8", errors="replace")),
+                    }
+                    for t, lp in top_logprobs_list[i].items()
+                ]
+            else:
+                entry["top_logprobs"] = []
+            lp_content.append(entry)
+        choice_logprobs = {"content": lp_content}
 
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
@@ -267,6 +300,7 @@ def _build_chat_completion_response(
             {
                 "index": 0,
                 "message": message,
+                "logprobs": choice_logprobs,
                 "finish_reason": finish_reason,
             }
         ],
@@ -470,13 +504,13 @@ def _build_app(backend_url: str, log_path: Optional[str] = None) -> FastAPI:
                 choice = completion_resp["choices"][0]
                 response_text = choice.get("text", "")
                 finish_reason = choice.get("finish_reason", "stop")
+                completion_logprobs = choice.get("logprobs")
 
                 # Prefer return_token_ids (exact), fall back to logprobs
                 response_token_ids: List[int] = choice.get("token_ids") or []
                 if not response_token_ids:
-                    logprobs_data = choice.get("logprobs")
-                    if logprobs_data and "token_ids" in logprobs_data:
-                        response_token_ids = logprobs_data["token_ids"]
+                    if completion_logprobs and "token_ids" in completion_logprobs:
+                        response_token_ids = completion_logprobs["token_ids"]
 
                 # Fallback: if no token IDs available, tokenize the response text
                 if not response_token_ids and response_text:
@@ -586,6 +620,7 @@ def _build_app(backend_url: str, log_path: Optional[str] = None) -> FastAPI:
                     prompt_tokens=prompt_token_count,
                     completion_tokens=len(response_token_ids),
                     finish_reason=finish_reason,
+                    logprobs_data=completion_logprobs,
                 )
                 return JSONResponse(content=response)
 
