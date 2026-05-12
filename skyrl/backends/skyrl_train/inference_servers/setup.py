@@ -277,8 +277,26 @@ def build_new_inference_client(
             placement_group=placement_group,
         )
 
+    # Optional TITO proxy
+    tito_proxy = None
+    if getattr(ie_cfg, "tito", None) and ie_cfg.tito.enabled:
+        from skyrl.backends.skyrl_train.inference_servers.tito.proxy import TITOProxyActor
+
+        tito_config = ie_cfg.tito
+        tito_proxy = TITOProxyActor(
+            backend_url=server_setup.proxy_url,
+            config=tito_config,
+        )
+        tito_url = tito_proxy.start()
+        logger.info(f"TITO Proxy: {tito_url} → {server_setup.proxy_url}")
+        # Generators hit the TITO proxy; control plane goes direct to servers
+        data_plane_url = tito_url
+        server_setup.tito_proxy = tito_proxy
+    else:
+        data_plane_url = server_setup.proxy_url
+
     client = RemoteInferenceClient(
-        proxy_url=server_setup.proxy_url,
+        proxy_url=data_plane_url,
         server_urls=server_setup.server_urls,
         model_name=cfg.trainer.policy.model.path,
         enable_return_routed_experts=ie_cfg.enable_return_routed_experts,

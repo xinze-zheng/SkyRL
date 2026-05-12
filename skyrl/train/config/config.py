@@ -20,6 +20,8 @@ from omegaconf import DictConfig, OmegaConf
 from skyrl_gym.envs.search.env import SearchEnvConfig
 from skyrl_gym.envs.sql.env import Text2SQLEnvConfig
 
+from skyrl.backends.skyrl_train.inference_servers.tito.config import TITOConfig
+
 # ---------------------------------------------------------------------------
 # Data
 # ---------------------------------------------------------------------------
@@ -512,6 +514,12 @@ class InferenceEngineConfig(BaseConfig):
     router_init_kwargs: Dict[str, Any] = field(default_factory=dict)
     """Pass-through kwargs applied to ``RouterArgs`` for the vllm-router.
     Names must match ``vllm_router.RouterArgs`` fields (e.g. ``policy``, ``request_timeout_secs``)."""
+
+    tito: TITOConfig = field(default_factory=TITOConfig)
+    """Configuration for the TITO (Token-In-Token-Out) proxy.
+    When ``tito.enabled=True``, a proxy is created between the generator
+    and the vLLM router that converts chat completions to token-level
+    completions and bookkeeps exact token IDs per session."""
 
 
 # ---------------------------------------------------------------------------

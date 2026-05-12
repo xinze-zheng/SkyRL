@@ -872,6 +872,43 @@ class RemoteInferenceClient:
 
         return results
 
+    async def get_session_data(self, session_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Retrieve TITO session tokens + loss_mask.
+
+        Args:
+            session_id: The TITO session ID to query.
+
+        Returns:
+            A dictionary containing the session data if found, otherwise None.
+        """
+        url = f"{self.proxy_url}/session/{session_id}/data"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        return await resp.json()
+                    logger.warning(f"get_session_data {session_id}: HTTP {resp.status} from {url}")
+                    return None
+        except Exception as e:
+            logger.warning(f"get_session_data {session_id}: {e}, url={url}")
+            return None
+
+    async def delete_session(self, session_id: str) -> None:
+        """
+        Clean up a TITO session after rollout completes.
+        
+        Args:
+            session_id: The TITO session ID to delete.
+        """
+        url = f"{self.proxy_url}/session/{session_id}"
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.delete(url, timeout=aiohttp.ClientTimeout(total=5)):
+                    pass
+        except Exception:
+            pass
+
     # ---------------------------
     # Control Plane (fan-out to all server_urls)
     # ---------------------------

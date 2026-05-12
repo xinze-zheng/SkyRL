@@ -30,7 +30,6 @@ class MiniSWEGeneratorConfig(GeneratorConfig):
 
     miniswe_config_path: str = ""
     miniswe_traj_dir: str = ""
-    use_tito_proxy: bool = False
 
 
 class DefaultAgentWithReminder(DefaultAgent):
@@ -180,28 +179,22 @@ class MiniSweAgentGenerator(SkyRLGymGenerator):
 
             if isinstance(inference_engine_client, RemoteInferenceClient):
                 backend_url = inference_engine_client.proxy_url
+                self._remote_client = inference_engine_client
             else:
                 backend_url = f"http://{self.http_server_inference_engine_client_host}:{self.http_server_inference_engine_client_port}"
+                self._remote_client = None
         except ImportError:
             backend_url = f"http://{self.http_server_inference_engine_client_host}:{self.http_server_inference_engine_client_port}"
+            self._remote_client = None
 
-        # Optionally start a TITO proxy between litellm and the vLLM router.
-        # When enabled, init_and_run tasks hit the proxy, which can intercept
-        # and convert chat completions to token-in-token-out calls.
-        # Each rollout gets a unique URL: http://proxy:PORT/session/{id}/v1
-        self._tito_proxy = None
-        if getattr(generator_cfg, "use_tito_proxy", False):
-            from .tito_proxy import TITOProxy
+        # Check if TITO proxy is enabled (configured at the inference engine level).
+        # When enabled, build_new_inference_client() already created the proxy and
+        # set proxy_url to point at it. We just need session URL multiplexing.
+        tito_cfg = getattr(generator_cfg.inference_engine, "tito", None)
+        self._tito_enabled = tito_cfg is not None and getattr(tito_cfg, "enabled", False)
 
-            self._tito_proxy = TITOProxy(
-                backend_url=backend_url,
-                log_path=getattr(generator_cfg, "miniswe_traj_dir", None),
-            )
-            self._tito_proxy.start()
-            # base_url is set per-rollout in minisweagent_agent_loop via session_url()
-            self.base_url = None
-        else:
-            self.base_url = backend_url + "/v1"
+        # base_url for non-TITO path or TITO session URL construction
+        self.base_url = backend_url + "/v1"
 
         self.generator_cfg = generator_cfg
         self.tokenizer = tokenizer
@@ -235,10 +228,13 @@ class MiniSweAgentGenerator(SkyRLGymGenerator):
 
         # Construct per-rollout base_url: when TITO proxy is active, each
         # rollout gets a unique URL with the session ID in the path.
+        # The proxy_url already points to the TITO proxy when tito.enabled.
         session_id = None
-        if self._tito_proxy is not None:
+        if self._tito_enabled:
             session_id = f"{trajectory_id.instance_id}_{trajectory_id.repetition_id}_{batch_metadata.global_step}"
-            rollout_base_url = self._tito_proxy.session_url(session_id)
+            # Strip trailing /v1 from base_url, add session path
+            proxy_base = self.base_url.rsplit("/v1", 1)[0]
+            rollout_base_url = f"{proxy_base}/session/{session_id}/v1"
         else:
             rollout_base_url = self.base_url
 
@@ -259,7 +255,7 @@ class MiniSweAgentGenerator(SkyRLGymGenerator):
             return None, None, None, None, None, None
 
         # --- TITO path: read tokens + loss_mask directly from proxy ---
-        if self._tito_proxy is not None and session_id is not None:
+        if self._tito_enabled and session_id is not None and self._remote_client is not None:
             return await self._read_tito_session(
                 session_id, messages, reward, error, max_tokens, max_input_length,
             )
@@ -337,18 +333,13 @@ class MiniSweAgentGenerator(SkyRLGymGenerator):
         Splits the proxy's accumulated tokens into prompt_ids (initial
         system+user, loss_mask=0) and response_ids (everything after).
         """
-        import httpx as _httpx
+        session_data = await self._remote_client.get_session_data(session_id)
 
-        data_url = f"{self._tito_proxy.url}/session/{session_id}/data"
-        async with _httpx.AsyncClient() as client:
-            resp = await client.get(data_url, timeout=10)
-
-        if resp.status_code != 200:
+        if session_data is None:
             from loguru import logger as _logger
-            _logger.warning(f"TITO session {session_id} data fetch failed: {resp.status_code}")
+            _logger.warning(f"TITO session {session_id} data fetch failed (proxy_url={self._remote_client.proxy_url})")
             return None, None, None, None, None, None
 
-        session_data = resp.json()
         all_tokens = session_data["tokens"]
         all_loss_mask = session_data["loss_mask"]
 
@@ -356,7 +347,6 @@ class MiniSweAgentGenerator(SkyRLGymGenerator):
             return None, None, None, None, None, None
 
         # Split into prompt (initial non-generated tokens) and response
-        # The prompt is the leading run of loss_mask=0 tokens
         first_gen = next(
             (i for i, m in enumerate(all_loss_mask) if m == 1), len(all_loss_mask)
         )
@@ -364,7 +354,6 @@ class MiniSweAgentGenerator(SkyRLGymGenerator):
         response_ids = all_tokens[first_gen:]
         response_loss_mask = all_loss_mask[first_gen:]
 
-        # Calculate maximum response tokens allowed
         max_response_tokens = max_tokens + max_input_length - len(prompt_ids)
 
         stop_reason = "complete"
@@ -375,10 +364,7 @@ class MiniSweAgentGenerator(SkyRLGymGenerator):
         response_loss_mask = response_loss_mask[:max_response_tokens]
 
         # Clean up session from proxy
-        async with _httpx.AsyncClient() as client:
-            await client.delete(
-                f"{self._tito_proxy.url}/session/{session_id}", timeout=5
-            )
+        await self._remote_client.delete_session(session_id)
 
         return (response_ids, reward, stop_reason, response_loss_mask, prompt_ids, None)
 
