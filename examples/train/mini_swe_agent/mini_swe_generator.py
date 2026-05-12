@@ -235,6 +235,7 @@ class MiniSweAgentGenerator(SkyRLGymGenerator):
 
         # Construct per-rollout base_url: when TITO proxy is active, each
         # rollout gets a unique URL with the session ID in the path.
+        session_id = None
         if self._tito_proxy is not None:
             session_id = f"{trajectory_id.instance_id}_{trajectory_id.repetition_id}_{batch_metadata.global_step}"
             rollout_base_url = self._tito_proxy.session_url(session_id)
@@ -257,6 +258,13 @@ class MiniSweAgentGenerator(SkyRLGymGenerator):
         if not len(messages):
             return None, None, None, None, None, None
 
+        # --- TITO path: read tokens + loss_mask directly from proxy ---
+        if self._tito_proxy is not None and session_id is not None:
+            return await self._read_tito_session(
+                session_id, messages, reward, error, max_tokens, max_input_length,
+            )
+
+        # --- Legacy path: re-tokenize from messages ---
         # TODO (sumanthrh): This is currently hardcoded for SWEBench with 2 initial messages (system and user).
         response_messages = messages[2:]
 
@@ -314,6 +322,65 @@ class MiniSweAgentGenerator(SkyRLGymGenerator):
         loss_mask = loss_mask[:max_response_tokens]
 
         return (response_ids, reward, stop_reason, loss_mask, prompt_ids, None)
+
+    async def _read_tito_session(
+        self,
+        session_id: str,
+        messages: List[Dict],
+        reward: float,
+        error: Optional[str],
+        max_tokens: int,
+        max_input_length: int,
+    ) -> Tuple[List[int], float, str, List[int], List[int], Optional[List[int]]]:
+        """Read token_ids and loss_mask from the TITO proxy session endpoint.
+
+        Splits the proxy's accumulated tokens into prompt_ids (initial
+        system+user, loss_mask=0) and response_ids (everything after).
+        """
+        import httpx as _httpx
+
+        data_url = f"{self._tito_proxy.url}/session/{session_id}/data"
+        async with _httpx.AsyncClient() as client:
+            resp = await client.get(data_url, timeout=10)
+
+        if resp.status_code != 200:
+            from loguru import logger as _logger
+            _logger.warning(f"TITO session {session_id} data fetch failed: {resp.status_code}")
+            return None, None, None, None, None, None
+
+        session_data = resp.json()
+        all_tokens = session_data["tokens"]
+        all_loss_mask = session_data["loss_mask"]
+
+        if not all_tokens:
+            return None, None, None, None, None, None
+
+        # Split into prompt (initial non-generated tokens) and response
+        # The prompt is the leading run of loss_mask=0 tokens
+        first_gen = next(
+            (i for i, m in enumerate(all_loss_mask) if m == 1), len(all_loss_mask)
+        )
+        prompt_ids = all_tokens[:first_gen]
+        response_ids = all_tokens[first_gen:]
+        response_loss_mask = all_loss_mask[first_gen:]
+
+        # Calculate maximum response tokens allowed
+        max_response_tokens = max_tokens + max_input_length - len(prompt_ids)
+
+        stop_reason = "complete"
+        if len(response_ids) > max_response_tokens:
+            stop_reason = "length"
+
+        response_ids = response_ids[:max_response_tokens]
+        response_loss_mask = response_loss_mask[:max_response_tokens]
+
+        # Clean up session from proxy
+        async with _httpx.AsyncClient() as client:
+            await client.delete(
+                f"{self._tito_proxy.url}/session/{session_id}", timeout=5
+            )
+
+        return (response_ids, reward, stop_reason, response_loss_mask, prompt_ids, None)
 
     async def generate(self, input_batch: GeneratorInput) -> GeneratorOutput:
         """
