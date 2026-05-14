@@ -5699,7 +5699,7 @@ name = "openai-harmony"
 version = "0.0.8"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "pydantic", marker = "(sys_platform == 'linux' and extra == 'extra-5-skyrl-fsdp') or (sys_platform == 'linux' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-fsdp' and extra == 'extra-5-skyrl-jax') or (extra == 'extra-5-skyrl-fsdp' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-jax' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-megatron' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-megatron' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-flashrl' and extra == 'extra-5-skyrl-fsdp') or (extra == 'extra-5-skyrl-flashrl' and extra == 'extra-5-skyrl-gpu') or (extra == 'extra-5-skyrl-flashrl' and extra == 'extra-5-skyrl-jax') or (extra == 'extra-5-skyrl-flashrl' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-flashrl' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-flashrl' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-miniswe' and extra == 'extra-5-skyrl-tpu')" },
+    { name = "pydantic" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/3e/92/2d038d096f29179c7c9571b431f9e739f87a487121901725e23fe338dd9d/openai_harmony-0.0.8.tar.gz", hash = "sha256:6e43f98e6c242fa2de6f8ea12eab24af63fa2ed3e89c06341fb9d92632c5cbdf", size = 284777, upload-time = "2025-11-05T19:07:06.727Z" }
 wheels = [
@@ -7638,6 +7638,23 @@ wheels = [
 ]
 
 [[package]]
+name = "renderers"
+version = "0.1.7"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "jinja2" },
+    { name = "numpy" },
+    { name = "openai" },
+    { name = "openai-harmony" },
+    { name = "tiktoken" },
+    { name = "transformers", marker = "sys_platform == 'linux' or (extra == 'extra-5-skyrl-flashrl' and extra == 'extra-5-skyrl-fsdp') or (extra == 'extra-5-skyrl-flashrl' and extra == 'extra-5-skyrl-gpu') or (extra == 'extra-5-skyrl-flashrl' and extra == 'extra-5-skyrl-jax') or (extra == 'extra-5-skyrl-flashrl' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-flashrl' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-flashrl' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-fsdp' and extra == 'extra-5-skyrl-jax') or (extra == 'extra-5-skyrl-fsdp' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-jax' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-megatron' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-megatron' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-miniswe' and extra == 'extra-5-skyrl-tpu')" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/b1/5f/fdd86253f562ffdecbdb56cb8591961f0b82914a9abc4ebf43976befb891/renderers-0.1.7.tar.gz", hash = "sha256:d17ccbc3813dd0ee3a6f7d8794308bd4300eb2a80dbc01e83c8f47513e9614f0", size = 209731, upload-time = "2026-05-12T12:51:07.559Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f2/71/af973d6fb806cc0f7e9f4d7cab3ed7265745e596298c8eab2185260c6979/renderers-0.1.7-py3-none-any.whl", hash = "sha256:64b119d13952df983462d72882aa97f1c7075fc4a7409a6b6b85ee88d83dfa52", size = 97934, upload-time = "2026-05-12T12:51:06.534Z" },
+]
+
+[[package]]
 name = "requests"
 version = "2.33.1"
 source = { registry = "https://pypi.org/simple" }
@@ -8594,6 +8611,9 @@ tinker = [
     { name = "sqlmodel" },
     { name = "tinker" },
 ]
+tito = [
+    { name = "renderers" },
+]
 tpu = [
     { name = "jax", extra = ["tpu"], marker = "(sys_platform == 'linux' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-miniswe' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-flashrl' and extra == 'extra-5-skyrl-fsdp') or (extra == 'extra-5-skyrl-flashrl' and extra == 'extra-5-skyrl-gpu') or (extra == 'extra-5-skyrl-flashrl' and extra == 'extra-5-skyrl-jax') or (extra == 'extra-5-skyrl-flashrl' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-flashrl' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-flashrl' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-fsdp' and extra == 'extra-5-skyrl-jax') or (extra == 'extra-5-skyrl-fsdp' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-gpu' and extra == 'extra-5-skyrl-tpu') or (extra == 'extra-5-skyrl-jax' and extra == 'extra-5-skyrl-megatron') or (extra == 'extra-5-skyrl-megatron' and extra == 'extra-5-skyrl-miniswe') or (extra == 'extra-5-skyrl-megatron' and extra == 'extra-5-skyrl-tpu')" },
 ]
@@ -8674,6 +8694,7 @@ requires-dist = [
     { name = "pytest-asyncio", marker = "extra == 'dev'" },
     { name = "pytest-forked", marker = "extra == 'dev'" },
     { name = "ray", marker = "extra == 'skyrl-train'", specifier = "==2.51.1" },
+    { name = "renderers", marker = "extra == 'tito'", specifier = ">=0.1.7" },
     { name = "rich", specifier = ">=14.1.0" },
     { name = "s3fs", marker = "extra == 'skyrl-train'" },
     { name = "safetensors", specifier = ">=0.6.2" },
@@ -8712,7 +8733,7 @@ requires-dist = [
     { name = "vllm-router", marker = "sys_platform == 'linux' and extra == 'skyrl-train'" },
     { name = "wandb", marker = "extra == 'skyrl-train'" },
 ]
-provides-extras = ["gpu", "tpu", "tinker", "aws", "gcp", "azure", "jax", "skyrl-train", "fsdp", "megatron", "flashrl", "miniswe", "harbor", "dev"]
+provides-extras = ["gpu", "tpu", "tinker", "aws", "gcp", "azure", "jax", "skyrl-train", "fsdp", "megatron", "flashrl", "miniswe", "tito", "harbor", "dev"]
 
 [[package]]
 name = "skyrl-gym"

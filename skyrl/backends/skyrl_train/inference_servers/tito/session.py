@@ -56,6 +56,34 @@ class SessionState:
     applied. Used by the prefix sanity check to locate the observation
     slice in the bookkeeping."""
 
+    def begin_turn(self) -> int:
+        """Snapshot ``messages_seen`` at the start of a new turn.
+
+        Must be called before updating ``messages_seen`` for the current
+        turn. The returned value is the count of messages processed in
+        prior turns, used to compute the delta and by the prefix check.
+
+        Returns:
+            Previous ``messages_seen`` count.
+        """
+        self._prev_messages_seen = self.messages_seen
+        return self._prev_messages_seen
+
+    @property
+    def prev_messages_seen(self) -> int:
+        """Messages-seen snapshot from the last :meth:`begin_turn` call."""
+        return self._prev_messages_seen
+
+    def append_prompt(self, token_ids: List[int]) -> None:
+        """Append prompt / observation tokens with ``loss_mask=0``."""
+        self.tokens.extend(token_ids)
+        self.loss_mask.extend([0] * len(token_ids))
+
+    def append_response(self, token_ids: List[int]) -> None:
+        """Append model-generated response tokens with ``loss_mask=1``."""
+        self.tokens.extend(token_ids)
+        self.loss_mask.extend([1] * len(token_ids))
+
     def to_dict(self) -> Dict[str, Any]:
         """Serialize session state for the ``GET /session/{id}/data`` endpoint.
 

@@ -1,7 +1,9 @@
+from __future__ import annotations
+
 import copy
 from argparse import Namespace
 from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, List, Optional, Tuple
 
 import ray
 from loguru import logger
@@ -25,6 +27,9 @@ from .utils import (
 )
 from .vllm_router import VLLMRouter
 
+if TYPE_CHECKING:
+    from .tito.proxy import TITOProxyActor
+
 NIXL_SIDE_CHANNEL_BASE_PORT = 5600
 VLLM_START_PORT = 8000
 
@@ -45,6 +50,9 @@ class InferenceServerSetup:
     server_groups: List[ServerGroup] = field(default_factory=list)
     prefill_server_groups: List[ServerGroup] = field(default_factory=list)
     decode_server_groups: List[ServerGroup] = field(default_factory=list)
+    tito_proxy: Optional[TITOProxyActor] = None
+    """TITO proxy actor, set when ``tito.enabled=True``. Holds the proxy
+    lifecycle so callers can shut it down alongside the router."""
 
 
 def create_inference_servers(
@@ -286,10 +294,10 @@ def build_new_inference_client(
         tito_proxy = TITOProxyActor(
             backend_url=server_setup.proxy_url,
             config=tito_config,
+            model_name=cfg.trainer.policy.model.path,
         )
         tito_url = tito_proxy.start()
         logger.info(f"TITO Proxy: {tito_url} → {server_setup.proxy_url}")
-        # Generators hit the TITO proxy; control plane goes direct to servers
         data_plane_url = tito_url
         server_setup.tito_proxy = tito_proxy
     else:

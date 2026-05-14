@@ -146,6 +146,11 @@ miniswe = [
     "mini-swe-agent>=1.12.0",
     "litellm",
 ]
+
+tito = [
+    "renderers>=0.1.7",
+]
+
 harbor = [
     "harbor[daytona,modal]; python_version >= '3.12'",
 ]

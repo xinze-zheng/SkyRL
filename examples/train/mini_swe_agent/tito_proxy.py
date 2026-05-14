@@ -6,3 +6,8 @@ This module re-exports the key classes for any code that imports from the old pa
 
 from skyrl.backends.skyrl_train.inference_servers.tito.config import TITOConfig  # noqa: F401
 from skyrl.backends.skyrl_train.inference_servers.tito.proxy import TITOProxyActor as TITOProxy  # noqa: F401
+from skyrl.backends.skyrl_train.inference_servers.tito.tokenizer_backends import (  # noqa: F401
+    HttpTokenizerBackend,
+    RendererTokenizerBackend,
+    TokenizerBackend,
+)
