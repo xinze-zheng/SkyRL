@@ -91,7 +91,7 @@ def _check_prefix(
     start = max(0, first_diff - window)
     end = min(max(prefix_len, len(cur_prefix)), first_diff + window)
     logger.warning(
-        f"[TITO prefix-check] session={session_id} turn={turn}: "
+        f"WARNING: session={session_id} turn={turn}: "
         f"MISMATCH at token {first_diff}/{prefix_len} (cur total={len(cur_tokens)})\n"
         f"  prev[{start}:{end}] = {prev_tokens[start:end]}\n"
         f"  cur [{start}:{end}] = {cur_tokens[start:end]}"
@@ -143,7 +143,7 @@ class TITOHandler:
         Returns:
             ``JSONResponse`` with OpenAI-compatible chat completion.
         """
-        messages = req_json.get("messages", [])
+        messages: List[Dict[str, Any]] = req_json.get("messages", [])
         model = req_json.get("model", "default")
         tools: Optional[List[Dict[str, Any]]] = req_json.get("tools")
 
@@ -153,12 +153,12 @@ class TITOHandler:
         session = self._sessions[session_id]
         turn = session.turn
         logger.debug(
-            f"[TITO] session={session_id} turn={turn} "
+            f"session={session_id} turn={turn} "
             f"n_msgs={len(messages)} roles={[m.get('role', '?') for m in messages]}"
         )
 
         try:
-            # --- Tokenize input ---
+            # Tokenize input
             if turn == 0:
                 prompt_ids = await self._tokenizer.tokenize_messages(
                     model, messages, add_generation_prompt=False, tools=tools,
@@ -167,32 +167,82 @@ class TITOHandler:
                 session.loss_mask = [0] * len(prompt_ids)
                 session.messages_seen = len(messages)
             else:
-                prev_seen = session.begin_turn() # How many messages have we seen in previous turns
+                prev_seen = session.begin_turn()
                 new_messages = messages[prev_seen:]
                 obs_start = 0
-                # Skip new assistant messages at the start (already included by proxy)
+                # Skip new assistant messages at the start (already bookkeept)
                 while obs_start < len(new_messages) and new_messages[obs_start].get("role") == "assistant":
                     obs_start += 1
                 obs_messages = new_messages[obs_start:]
+
                 if obs_messages:
-                    delta_ids = await self._tokenizer.tokenize_delta(
-                        model, obs_messages, tools=tools,
-                    )
-                    session.append_prompt(delta_ids)
-                    logger.debug(
-                        f"[TITO] session={session_id} turn={turn}: "
-                        f"obs {len(obs_messages)} msgs → {len(delta_ids)} tokens "
-                        f"(skipped {obs_start} assistant msgs)"
-                    )
+                    bridged = False
+
+                    # Strategy 1: bridge_to_next_turn (renderer only, drift-free)
+                    if self._renderer_backend is not None:
+                        previous_prompt_ids = session.tokens[:session.last_prompt_len]
+                        previous_completion_ids = session.tokens[session.last_prompt_len:]
+                        bridge_result = self._renderer_backend.bridge_to_next_turn(
+                            previous_prompt_ids, previous_completion_ids,
+                            obs_messages, tools=tools,
+                        )
+                        if bridge_result is not None:
+                            # Bridge succeeded: the result is the full next prompt
+                            # (prev_prompt + prev_completion + new_obs + gen_prompt).
+                            # Extract the tokens without the gen prompt suffix by
+                            # comparing to a no-gen-prompt render length.
+                            gen_prompt_len = len(await self._tokenizer.get_gen_prompt_ids(
+                                model, messages, tools=tools,
+                            ))
+                            new_tokens = bridge_result[:len(bridge_result) - gen_prompt_len]
+                            # Rebuild loss mask: preserve old mask, append 0s for new obs
+                            new_obs_len = len(new_tokens) - len(session.tokens)
+                            if new_obs_len >= 0:
+                                session.tokens = list(new_tokens)
+                                session.loss_mask.extend([0] * new_obs_len)
+                                bridged = True
+                                logger.debug(
+                                    f"session={session_id} turn={turn}: "
+                                    f"bridge OK, +{new_obs_len} obs tokens"
+                                )
+
+                        if not bridged:
+                            # Strategy 2: full re-render (state reset)
+                            logger.info(
+                                f"session={session_id} turn={turn}: "
+                                f"bridge returned None, falling back to full re-render"
+                            )
+                            full_ids = await self._tokenizer.tokenize_messages(
+                                model, messages, add_generation_prompt=False, tools=tools,
+                            )
+                            # Rebuild loss mask: we lose per-token attribution, but
+                            # we can recover it from the previous mask for the prefix
+                            # that matches, and mark everything else as 0.
+                            old_len = min(len(session.loss_mask), len(full_ids))
+                            new_mask = session.loss_mask[:old_len] + [0] * (len(full_ids) - old_len)
+                            session.reset_from_full_render(full_ids, new_mask)
+                            bridged = True
+                    else:
+                        # Strategy 3: dummy-base delta (no renderer available)
+                        delta_ids = await self._tokenizer.tokenize_delta(
+                            model, obs_messages, tools=tools,
+                        )
+                        session.append_prompt(delta_ids)
+                        logger.debug(
+                            f"session={session_id} turn={turn}: "
+                            f"obs {len(obs_messages)} msgs → {len(delta_ids)} tokens "
+                            f"(skipped {obs_start} assistant msgs)"
+                        )
+
                 session.messages_seen = len(messages)
 
-            # --- Generation prompt ---
+            # Generation prompt 
             gen_prompt_ids = await self._tokenizer.get_gen_prompt_ids(
                 model, messages, tools=tools,
             )
             full_prompt_ids = session.tokens + gen_prompt_ids
 
-            # --- /v1/completions with token IDs ---
+            #  /v1/completions with token IDs
             completion_params: Dict[str, Any] = {
                 "model": model,
                 "prompt": full_prompt_ids,
@@ -211,7 +261,7 @@ class TITOHandler:
                 completion_params["max_tokens"] = req_json["max_completion_tokens"]
 
             logger.debug(
-                f"[TITO] session={session_id} turn={turn}: "
+                f"session={session_id} turn={turn}: "
                 f"/v1/completions with {len(full_prompt_ids)} prompt tokens"
             )
 
@@ -223,7 +273,6 @@ class TITOHandler:
             resp.raise_for_status()
             completion_resp = resp.json()
 
-            # --- Extract response ---
             choice = completion_resp["choices"][0]
             response_text = choice.get("text", "")
             finish_reason = choice.get("finish_reason", "stop")
@@ -233,13 +282,14 @@ class TITOHandler:
             if not response_token_ids and completion_logprobs:
                 response_token_ids = completion_logprobs.get("token_ids", [])
             if not response_token_ids and response_text:
-                logger.warning(f"[TITO] session={session_id} turn={turn}: fallback tokenize response")
+                logger.warning(f"session={session_id} turn={turn}: fallback tokenize response")
                 assistant_msg = {"role": "assistant", "content": response_text}
                 response_token_ids = await self._tokenizer.tokenize_delta(
                     model, [assistant_msg], tools=tools,
                 )
 
-            # --- Bookkeep ---
+            # Bookkeep — record prompt boundary before appending response
+            session.last_prompt_len = len(session.tokens)
             session.append_response(response_token_ids)
 
             logger.debug(
@@ -250,17 +300,17 @@ class TITOHandler:
                 f"finish={finish_reason}"
             )
 
-            # --- Parse tool calls ---
+            # Parse tool call
             if self._renderer_backend is not None and response_token_ids:
                 parsed = self._renderer_backend.parse_response(response_token_ids)
             else:
                 parsed = self._tool_parser.parse(response_text)
 
-            # --- Prefix sanity check ---
+            # Prefix sanity check
             if self._config.prefix_check:
                 await self._run_prefix_check(session_id, turn, session, messages, response_token_ids, tools)
 
-            # --- Build response ---
+            # Build response
             session.turn += 1
             response = build_chat_completion_response(
                 model=model,
@@ -274,7 +324,7 @@ class TITOHandler:
             return JSONResponse(content=response)
 
         except Exception as e:
-            logger.error(f"[TITO] session={session_id} turn={turn}: ERROR {e}\n{traceback.format_exc()}")
+            logger.error(f"session={session_id} turn={turn}: ERROR {e}\n{traceback.format_exc()}")
             return JSONResponse(content={"error": str(e)}, status_code=500)
 
     async def _run_prefix_check(
@@ -327,17 +377,17 @@ class TITOHandler:
                     )
                     if bk_obs == oracle_delta:
                         logger.debug(
-                            f"[TITO prefix-check] session={session_id} turn={turn}: "
+                            f"session={session_id} turn={turn}: "
                             f"OK (obs delta {len(oracle_delta)} tokens)"
                         )
                     else:
                         logger.warning(
-                            f"[TITO prefix-check] session={session_id} turn={turn}: OBS DELTA MISMATCH"
+                            f"session={session_id} turn={turn}: OBS DELTA MISMATCH"
                         )
                         _check_prefix(session_id, turn, oracle_delta, bk_obs)
         except Exception as e:
             logger.error(
-                f"[TITO prefix-check] session={session_id} turn={turn}: error {e}\n{traceback.format_exc()}"
+                f"session={session_id} turn={turn}: error {e}\n{traceback.format_exc()}"
             )
 
 

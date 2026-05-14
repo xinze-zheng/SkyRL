@@ -266,25 +266,6 @@ class RendererTokenizerBackend:
         )
         return RendererTokenizerBackend(renderer, http_fallback)
 
-    def _to_renderer_messages(
-        self, messages: List[Dict[str, Any]]
-    ) -> List[Dict[str, Any]]:
-        """Convert OpenAI-format messages to renderer-compatible format.
-
-        The ``renderers`` library expects messages as dicts with ``role``
-        and ``content`` keys. Tool-call messages need ``tool_calls`` in
-        the format the renderer expects.
-        """
-        # renderers accepts standard OpenAI message dicts directly
-        return messages
-
-    def _to_renderer_tools(
-        self, tools: Optional[List[Dict[str, Any]]]
-    ) -> Optional[List[Any]]:
-        """Convert OpenAI tool definitions to renderer format."""
-        # renderers accepts standard OpenAI tool spec dicts
-        return tools
-
     async def tokenize_messages(
         self,
         model: str,
@@ -294,12 +275,8 @@ class RendererTokenizerBackend:
         tools: Optional[List[Dict[str, Any]]] = None,
     ) -> List[int]:
         """Tokenize messages locally using the renderer."""
-        r_messages = self._to_renderer_messages(messages)
-        r_tools = self._to_renderer_tools(tools)
         return self._renderer.render_ids(
-            r_messages,
-            tools=r_tools,
-            add_generation_prompt=add_generation_prompt,
+            messages, tools=tools, add_generation_prompt=add_generation_prompt,
         )
 
     async def tokenize_delta(
@@ -314,14 +291,11 @@ class RendererTokenizerBackend:
         Uses the same fixed-base approach as ``HttpTokenizerBackend``
         but with local tokenization (no HTTP calls).
         """
-        r_tools = self._to_renderer_tools(tools)
         dummy_ids = self._renderer.render_ids(
-            DUMMY_BASE, tools=r_tools, add_generation_prompt=False,
+            DUMMY_BASE, tools=tools, add_generation_prompt=False,
         )
         full_ids = self._renderer.render_ids(
-            DUMMY_BASE + self._to_renderer_messages(new_messages),
-            tools=r_tools,
-            add_generation_prompt=False,
+            DUMMY_BASE + new_messages, tools=tools, add_generation_prompt=False,
         )
         return full_ids[len(dummy_ids):]
 
@@ -333,13 +307,11 @@ class RendererTokenizerBackend:
         tools: Optional[List[Dict[str, Any]]] = None,
     ) -> List[int]:
         """Extract generation-prompt token IDs locally."""
-        r_messages = self._to_renderer_messages(messages)
-        r_tools = self._to_renderer_tools(tools)
         ids_with = self._renderer.render_ids(
-            r_messages, tools=r_tools, add_generation_prompt=True,
+            messages, tools=tools, add_generation_prompt=True,
         )
         ids_without = self._renderer.render_ids(
-            r_messages, tools=r_tools, add_generation_prompt=False,
+            messages, tools=tools, add_generation_prompt=False,
         )
         return ids_with[len(ids_without):]
 
@@ -366,13 +338,11 @@ class RendererTokenizerBackend:
         Returns:
             Full next-turn prompt IDs, or ``None`` if bridge is unsafe.
         """
-        r_messages = self._to_renderer_messages(new_messages)
-        r_tools = self._to_renderer_tools(tools)
         result = self._renderer.bridge_to_next_turn(
             previous_prompt_ids=previous_prompt_ids,
             previous_completion_ids=previous_completion_ids,
-            new_messages=r_messages,
-            tools=r_tools,
+            new_messages=new_messages,
+            tools=tools,
         )
         if result is None:
             return None

@@ -56,6 +56,12 @@ class SessionState:
     applied. Used by the prefix sanity check to locate the observation
     slice in the bookkeeping."""
 
+    last_prompt_len: int = 0
+    """Length of the prompt token IDs (excluding gen prompt) at the end of
+    the last completed turn. Used by ``bridge_to_next_turn`` to split
+    ``session.tokens`` into ``previous_prompt_ids`` and
+    ``previous_completion_ids``."""
+
     def begin_turn(self) -> int:
         """Snapshot ``messages_seen`` at the start of a new turn.
 
@@ -83,6 +89,21 @@ class SessionState:
         """Append model-generated response tokens with ``loss_mask=1``."""
         self.tokens.extend(token_ids)
         self.loss_mask.extend([1] * len(token_ids))
+
+    def reset_from_full_render(self, token_ids: List[int], loss_mask: List[int]) -> None:
+        """Replace all token state with a fresh full re-render.
+
+        Called when ``bridge_to_next_turn`` returns ``None`` and the
+        handler falls back to re-rendering the entire conversation.
+        The new token sequence becomes the baseline for future turns.
+
+        Args:
+            token_ids: Fully re-rendered token IDs for the conversation.
+            loss_mask: Corresponding loss mask (0 for all, since
+                re-rendered tokens lose per-token attribution).
+        """
+        self.tokens = list(token_ids)
+        self.loss_mask = list(loss_mask)
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize session state for the ``GET /session/{id}/data`` endpoint.
