@@ -1,4 +1,4 @@
-from typing import TYPE_CHECKING, Any, Dict, List
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 import ray
 from packaging import version
@@ -76,10 +76,14 @@ class RayWrappedInferenceEngine(InferenceEngineInterface):
     async def completion(self, request_payload: Dict[str, Any]) -> Dict[str, Any]:
         return await self.inference_engine_actor.completion.remote(request_payload)
 
-    async def pause_generation(self) -> None:
+    async def pause_generation(self, lora_name: Optional[str] = None) -> None:
+        if lora_name is not None:
+            raise NotImplementedError("targeted pause is HTTP-only")
         return await self.inference_engine_actor.pause_generation.remote()
 
-    async def resume_generation(self) -> None:
+    async def resume_generation(self, lora_name: Optional[str] = None) -> None:
+        if lora_name is not None:
+            raise NotImplementedError("targeted pause is HTTP-only")
         return await self.inference_engine_actor.resume_generation.remote()
 
 
@@ -112,7 +116,7 @@ def create_ray_wrapped_inference_engines(
     engine_init_kwargs: Dict[str, Any] = {},
     rope_scaling: Dict[str, Any] = {},
     rope_theta: float | None = None,
-    enable_ray_prometheus_stats: bool = False,
+    enable_ray_prometheus_stats: bool = True,
     enable_return_routed_experts: bool = False,
     served_model_name: str | None = None,
     distributed_executor_backend: str = "ray",

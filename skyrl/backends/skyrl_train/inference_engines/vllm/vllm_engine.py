@@ -216,10 +216,10 @@ class BaseVLLMInferenceEngine(InferenceEngineInterface):
         """Reset the prefix cache. Subclasses override for async version."""
         return self.llm.llm_engine.reset_prefix_cache()
 
-    async def pause_generation(self, clear_cache: bool = False) -> None:
+    async def pause_generation(self, lora_name: Optional[str] = None, clear_cache: bool = False) -> None:
         raise NotImplementedError("pause_generation is only supported for AsyncVLLMInferenceEngine.")
 
-    async def resume_generation(self) -> None:
+    async def resume_generation(self, lora_name: Optional[str] = None) -> None:
         raise NotImplementedError("resume_generation is only supported for AsyncVLLMInferenceEngine.")
 
 
@@ -360,7 +360,7 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         enable_log_requests = kwargs.pop("enable_log_requests", False)
         max_log_len = kwargs.pop("max_log_len", None)
 
-        engine_args = vllm.AsyncEngineArgs(enable_log_requests=enable_log_requests, **kwargs)
+        engine_args = vllm.AsyncEngineArgs(enable_log_requests=enable_log_requests, kv_cache_metrics=True, **kwargs)
 
         # Setup stat loggers for vLLM v1 if Ray Prometheus stats are enabled
         stat_loggers = None
@@ -391,7 +391,6 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
 
         chat_template = openai_kwargs.pop("chat_template", None)
 
-        from vllm.plugins.io_processors import get_io_processor
         from vllm.renderers import renderer_from_config
 
         model_registry = OpenAIModelRegistry(
@@ -399,15 +398,9 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
             base_model_paths=base_model_paths,
         )
         renderer = renderer_from_config(engine.vllm_config)
-        io_processor = get_io_processor(
-            engine.vllm_config,
-            renderer,
-            engine.model_config.io_processor_plugin,
-        )
         openai_serving_render = OpenAIServingRender(
             model_config=engine.model_config,
             renderer=renderer,
-            io_processor=io_processor,
             model_registry=model_registry,
             request_logger=request_logger,
             chat_template=chat_template,
@@ -655,14 +648,18 @@ class AsyncVLLMInferenceEngine(BaseVLLMInferenceEngine):
         """
         return await self._handle_openai_request(request_payload, endpoint="/completions")
 
-    async def pause_generation(self, clear_cache: bool = False) -> None:
+    async def pause_generation(self, lora_name: Optional[str] = None, clear_cache: bool = False) -> None:
         """Pause generation using vLLM's native keep mode, freezing in-flight requests."""
+        if lora_name is not None:
+            raise NotImplementedError("targeted pause is HTTP-only")
         engine = self._get_engine()
         await engine.pause_generation(mode="keep", clear_cache=clear_cache)
         logger.info("pause_generation(mode='keep') finished")
 
-    async def resume_generation(self) -> None:
+    async def resume_generation(self, lora_name: Optional[str] = None) -> None:
         """Resume generation after a keep-mode pause."""
+        if lora_name is not None:
+            raise NotImplementedError("targeted pause is HTTP-only")
         engine = self._get_engine()
         await engine.resume_generation()
         logger.info("resume_generation() finished")

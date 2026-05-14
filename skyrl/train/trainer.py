@@ -18,6 +18,7 @@ from transformers import AutoTokenizer
 from skyrl.backends.skyrl_train.distributed.dispatch import (
     ActorInfo,
     MeshRank,
+    loss_fn_outputs_to_tensor,
 )
 from skyrl.backends.skyrl_train.inference_engines.inference_engine_client import (
     InferenceEngineClient,
@@ -81,6 +82,7 @@ from skyrl.train.utils.trainer_utils import (
     zero_variance_filter,
 )
 from skyrl.train.utils.utils import ResolvedPlacementGroup, configure_ray_worker_logging
+from skyrl.train.utils.vllm_metrics_scraper import VLLMMetricsScraper
 
 
 class RayPPOTrainer:
@@ -117,6 +119,10 @@ class RayPPOTrainer:
         self.all_metrics = {}
         self.all_timings = {}
         self.global_step = 0
+
+        self._vllm_metrics_scraper: Optional[VLLMMetricsScraper] = (
+            VLLMMetricsScraper() if cfg.generator.inference_engine.enable_ray_prometheus_stats else None
+        )
 
         # initialized in `build_models`
         self.policy_model: PPORayActorGroup = None
@@ -336,6 +342,8 @@ class RayPPOTrainer:
                     **self.all_metrics,
                     **{f"timing/{k}": v for k, v in self.all_timings.items()},
                 }
+                if self._vllm_metrics_scraper is not None:
+                    log_payload.update(await self._vllm_metrics_scraper.sample())
                 self.tracker.log(log_payload, step=self.global_step, commit=True)
                 self.all_metrics = {}
                 self.all_timings = {}
@@ -360,6 +368,8 @@ class RayPPOTrainer:
             with Timer("save_hf_model", self.all_timings):
                 self.save_models()
                 logger.info("Saved final model.")
+        if self._vllm_metrics_scraper is not None:
+            await self._vllm_metrics_scraper.aclose()
         self.tracker.finish()
         logger.info("Training done!")
 
@@ -986,17 +996,17 @@ class RayPPOTrainer:
         # Critic forward (dispatch handles offload/backload automatically)
         if self.has_critic:
             critic_output = self.dispatch.forward("critic", data_fwd_pass)
-            values = critic_output["output"]
+            values = loss_fn_outputs_to_tensor(critic_output.loss_fn_outputs, key="values")
 
         # Ref forward
         if self.ref_model is not None:
             ref_output = self.dispatch.forward("ref", data_fwd_pass)
-            base_log_probs = ref_output["output"]
+            base_log_probs = loss_fn_outputs_to_tensor(ref_output.loss_fn_outputs, key="logprobs")
             self.dispatch.empty_cache("ref")
 
         # Policy forward
         policy_output = self.dispatch.forward("policy", data_fwd_pass)
-        action_log_probs = policy_output["output"]
+        action_log_probs = loss_fn_outputs_to_tensor(policy_output.loss_fn_outputs, key="logprobs")
 
         # Empty cache after all forward passes
         self.dispatch.empty_cache()
@@ -1151,7 +1161,7 @@ class RayPPOTrainer:
         for _epoch in range(self.cfg.trainer.update_epochs_per_batch):
             for chunk_refs in all_chunk_refs:
                 status = self.dispatch.forward_backward_from_staged(model, chunk_refs)
-                for k, v in status.items():
+                for k, v in status.metrics.items():
                     all_metrics[k].append(v)
 
                 # Optimizer step after each mini batch
@@ -1160,8 +1170,6 @@ class RayPPOTrainer:
                     all_metrics["grad_norm"].append(grad_norm)
 
         # Reduce metrics across all mini-batches and epochs
-        # pop out loss_fn_outputs since it's not a scalar metric and to avoid logging it
-        all_metrics.pop("loss_fn_outputs", None)
         reduced_metrics = reduce_metrics(all_metrics, sum_loss_metrics=False)
         return reduced_metrics
 

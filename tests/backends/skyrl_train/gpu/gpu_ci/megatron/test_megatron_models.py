@@ -9,7 +9,8 @@ import torch
 from transformers import AutoTokenizer
 
 from skyrl.backends.skyrl_train.distributed.dispatch import (
-    concatenate_outputs_after_mesh_dispatch,
+    WorkerOutput,
+    loss_fn_outputs_to_tensor,
 )
 from skyrl.backends.skyrl_train.inference_engines.utils import (
     get_sampling_params_for_backend,
@@ -31,6 +32,14 @@ from tests.backends.skyrl_train.gpu.utils import (
 NUM_PROMPTS = 10
 N_SAMPLES_PER_PROMPT = 4
 MAX_GENERATE_LENGTH = 128
+
+
+# vLLM's Triton MLA decode kernel (the only MLA backend on sm < 9.0) fails
+# to compile for glm-4's MLA shape; FLASH_ATTN_MLA / FLASHMLA need Hopper.
+_skip_mla_on_pre_hopper = pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 9,
+    reason="no working MLA backend for glm-4 on pre-Hopper GPUs",
+)
 
 
 def get_test_actor_config(model_name) -> SkyRLTrainConfig:
@@ -159,7 +168,20 @@ async def construct_training_input_from_generator_output(generator_output, token
     [
         pytest.param(2, 1, 1, 2, 1, 2, 4, "eatang/qwen3-moe-tiny-random", 1e-1, 2e-1, id="qwen3-moe_tp2_ep2"),
         pytest.param(1, 2, 2, 1, None, 2, 4, "eatang/qwen3-moe-tiny-random", 1e-1, 2e-1, id="qwen3-moe_pp2_cp2"),
-        pytest.param(2, 1, 1, 2, 1, 2, 4, "eatang/glm-4.7-flash-tiny-random", 1e-1, 2e-2, id="glm-4.7-flash_tp2_ep2"),
+        pytest.param(
+            2,
+            1,
+            1,
+            2,
+            1,
+            2,
+            4,
+            "eatang/glm-4.7-flash-tiny-random",
+            1e-1,
+            2e-2,
+            id="glm-4.7-flash_tp2_ep2",
+            marks=_skip_mla_on_pre_hopper,
+        ),
         pytest.param(
             2,
             1,
@@ -245,7 +267,8 @@ async def test_logprobs_matching_roundtrip(
 
             refs = policy.async_run_ray_method("mesh", "forward", data=training_input)
             results = ray.get(refs)
-            logprobs_megatron = concatenate_outputs_after_mesh_dispatch(policy.actor_infos, results)["output"]
+            policy_output = WorkerOutput.cat(policy.actor_infos, results)
+            logprobs_megatron = loss_fn_outputs_to_tensor(policy_output.loss_fn_outputs, key="logprobs")
 
             mask = response_mask.bool()
 
