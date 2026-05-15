@@ -130,6 +130,28 @@ class TITOHandler:
         self._renderer_backend: Optional[RendererTokenizerBackend] = (
             tokenizer_backend if isinstance(tokenizer_backend, RendererTokenizerBackend) else None
         )
+        self._max_model_len: Optional[int] = None
+
+    async def _get_max_model_len(self) -> Optional[int]:
+        """Fetch ``max_model_len`` from the backend on first call.
+
+        Queries ``/v1/models`` and caches the result. Returns ``None``
+        if the backend doesn't expose this field.
+        """
+        if self._max_model_len is not None:
+            return self._max_model_len
+        try:
+            resp = await self._client.get(f"{self._backend_url}/v1/models", timeout=10)
+            if resp.status_code == 200:
+                data = resp.json()
+                models = data.get("data", [])
+                if models:
+                    self._max_model_len = models[0].get("max_model_len")
+                    if self._max_model_len:
+                        logger.info(f"Fetched max_model_len={self._max_model_len} from backend")
+        except Exception as e:
+            logger.warning(f"Failed to fetch max_model_len: {e}")
+        return self._max_model_len
 
     async def handle_chat_completion(
         self, session_id: str, req_json: Dict[str, Any]
@@ -260,6 +282,30 @@ class TITOHandler:
             if "max_completion_tokens" in req_json and "max_tokens" not in completion_params:
                 completion_params["max_tokens"] = req_json["max_completion_tokens"]
 
+            # Cap max_tokens to avoid exceeding the model's context window
+            max_model_len = await self._get_max_model_len()
+            if max_model_len is not None:
+                prompt_len = len(full_prompt_ids)
+                headroom = max_model_len - prompt_len
+                if headroom <= 0:
+                    logger.warning(
+                        f"session={session_id} turn={turn}: "
+                        f"prompt ({prompt_len} tokens) exceeds max_model_len ({max_model_len}), "
+                        f"returning error"
+                    )
+                    return JSONResponse(
+                        content={"error": f"Prompt length ({prompt_len}) exceeds max context ({max_model_len})"},
+                        status_code=400,
+                    )
+                requested = completion_params.get("max_tokens", 2048)
+                if requested > headroom:
+                    logger.debug(
+                        f"session={session_id} turn={turn}: "
+                        f"capping max_tokens {requested} → {headroom} "
+                        f"(prompt={prompt_len}, max_model_len={max_model_len})"
+                    )
+                    completion_params["max_tokens"] = headroom
+
             logger.debug(
                 f"session={session_id} turn={turn}: "
                 f"/v1/completions with {len(full_prompt_ids)} prompt tokens"
@@ -270,6 +316,12 @@ class TITOHandler:
                 json=completion_params,
                 timeout=300,
             )
+            if resp.status_code != 200:
+                error_body = resp.text
+                logger.error(
+                    f"session={session_id} turn={turn}: "
+                    f"/v1/completions returned {resp.status_code}: {error_body[:500]}"
+                )
             resp.raise_for_status()
             completion_resp = resp.json()
 
