@@ -291,12 +291,20 @@ class TITOHandler:
                     logger.warning(
                         f"session={session_id} turn={turn}: "
                         f"prompt ({prompt_len} tokens) exceeds max_model_len ({max_model_len}), "
-                        f"returning error"
+                        f"returning length-stop response"
                     )
-                    return JSONResponse(
-                        content={"error": f"Prompt length ({prompt_len}) exceeds max context ({max_model_len})"},
-                        status_code=400,
+                    # Return a valid chat completion with finish_reason="length"
+                    # so the agent framework treats it as a normal truncated response
+                    session.turn += 1
+                    response = build_chat_completion_response(
+                        model=model,
+                        content="",
+                        tool_calls=None,
+                        prompt_tokens=prompt_len,
+                        completion_tokens=0,
+                        finish_reason="length",
                     )
+                    return JSONResponse(content=response)
                 requested = completion_params.get("max_tokens", 2048)
                 if requested > headroom:
                     logger.debug(

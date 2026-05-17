@@ -97,7 +97,7 @@ agent:
   format_error_template: |
     No tool calls found in the response. Every response MUST include at least one tool call to the bash function.
     Please use the bash tool to execute your command.
-  step_limit: 5 
+  step_limit: 15 
   cost_limit: 3.
 
 environment:
