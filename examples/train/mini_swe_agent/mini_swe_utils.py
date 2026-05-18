@@ -24,6 +24,18 @@ def get_sb_environment(config: dict, instance: dict, data_source: str) -> Enviro
         env_config["image"] = image_name
     elif env_config["environment_class"] == "singularity":
         env_config["image"] = f"docker://{image_name}"
+    elif env_config["environment_class"] == "daytona":
+        env_config["image"] = image_name
+        from .daytona_env import DaytonaEnvironment
+
+        filtered = {k: v for k, v in env_config.items() if k != "environment_class"}
+        env = DaytonaEnvironment(**filtered)
+        if startup_command := config.get("run", {}).get("env_startup_command"):
+            startup_command = Template(startup_command).render(**instance)
+            out = env.execute({"command": startup_command})
+            if out["returncode"] != 0:
+                raise RuntimeError(f"Error executing startup command: {out}")
+        return env
     env = get_environment(env_config)
     if startup_command := config.get("run", {}).get("env_startup_command"):
         startup_command = Template(startup_command).render(**instance)

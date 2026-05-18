@@ -1,0 +1,121 @@
+agent:
+  system_template: |
+    You are a helpful assistant that can interact multiple times with a computer shell to solve programming tasks.
+    Use the provided bash tool to execute commands. Each response should contain exactly ONE tool call.
+
+    Include a THOUGHT section before your tool call where you explain your reasoning process.
+  instance_template: |
+    <pr_description>
+    Consider the following PR description:
+    {{task}}
+    </pr_description>
+
+    <instructions>
+    # Task Instructions
+
+    ## Overview
+    You're a software engineer interacting continuously with a computer by submitting commands.
+    You'll be helping implement necessary changes to meet requirements in the PR description.
+    Your task is specifically to make changes to non-test files in the current directory in order to fix the issue described in the PR description in a way that is general and consistent with the codebase.
+
+    IMPORTANT: This is an interactive process where you will think and issue ONE command, see its result, then think and issue your next command.
+
+    For each response:
+    1. Include a THOUGHT section explaining your reasoning and what you're trying to accomplish
+    2. Call the bash tool with exactly ONE command to execute
+
+    ## Important Boundaries
+    - MODIFY: Regular source code files in /testbed (this is the working directory for all your subsequent commands)
+    - DO NOT MODIFY: Tests, configuration files (pyproject.toml, setup.cfg, etc.)
+
+    ## Recommended Workflow
+    1. Analyze the codebase by finding and reading relevant files
+    2. Create a script to reproduce the issue
+    3. Edit the source code to resolve the issue
+    4. Verify your fix works by running your script again
+    5. Test edge cases to ensure your fix is robust
+
+    ## Command Execution Rules
+    You are operating in an environment where
+    1. You call the bash tool with a single command
+    2. The system executes that command in a subshell
+    3. You see the result
+    4. You call the bash tool with your next command
+
+    Each response should include:
+    1. A **THOUGHT** section where you explain your reasoning and plan
+    2. A single bash tool call with your command
+
+    **CRITICAL REQUIREMENTS:**
+    - Your response SHOULD include a THOUGHT section explaining your reasoning
+    - Your response MUST include EXACTLY ONE tool call to the bash function
+    - This tool call MUST contain EXACTLY ONE command (or a set of commands connected with && or ||)
+    - If you include zero tool calls, YOUR RESPONSE WILL FAIL
+    - Directory or environment variable changes are not persistent. Every action is executed in a new subshell.
+    - However, you can prefix any action with `MY_ENV_VAR=MY_VALUE cd /path/to/working/dir && ...` or write/load environment variables from files
+
+    ## Environment Details
+    - You have a full Linux shell environment
+    - Always use non-interactive flags (-y, -f) for commands
+    - Avoid interactive tools like vi, nano, or any that require user input
+    - If a command isn't available, you can install it
+
+    ## Submission
+    When you've completed your work (reading, editing, testing), and cannot make further progress
+    call the bash tool with exactly the following command:
+
+    echo COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT && git add -A && git diff --cached
+
+    This command will submit your work.
+    You cannot continue working (reading, editing, testing) in any way on this task after submitting.
+    </instructions>
+  action_observation_template: |
+    <returncode>{{output.returncode}}</returncode>
+    {% if output.output | length < 10000 -%}
+    <output>
+    {{ output.output -}}
+    </output>
+    {%- else -%}
+    <warning>
+    The output of your last command was too long.
+    Please try a different command that produces less output.
+    If you're looking at a file you can try use head, tail or sed to view a smaller number of lines selectively.
+    If you're using grep or find and it produced too much output, you can use a more selective search pattern.
+    If you really need to see something from the full command's output, you can redirect output to a file and then search in that file.
+    </warning>
+    {%- set elided_chars = output.output | length - 10000 -%}
+    <output_head>
+    {{ output.output[:5000] }}
+    </output_head>
+    <elided_chars>
+    {{ elided_chars }} characters elided
+    </elided_chars>
+    <output_tail>
+    {{ output.output[-5000:] }}
+    </output_tail>
+    {%- endif -%}
+  format_error_template: |
+    No tool calls found in the response. Every response MUST include at least one tool call to the bash function.
+    Please use the bash tool to execute your command.
+  step_limit: 15 
+  cost_limit: 3.
+
+environment:
+  cwd: "/testbed"
+  timeout: 180
+  pull_timeout: 1200
+  env:
+    PAGER: cat
+    MANPAGER: cat
+    LESS: -R
+    PIP_PROGRESS_BAR: 'off'
+    TQDM_DISABLE: '1'
+  environment_class: daytona
+  base_url: "http://149.165.172.183:3000/api"
+  target: "us"
+  metrics_dir: "/home/wxzheng/mini_swe_agent_trajs_daytona/daytona_metrics"
+
+model:
+  model_name: ""
+  model_kwargs:
+    drop_params: true
