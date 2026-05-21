@@ -99,6 +99,28 @@ def _check_prefix(
     return False
 
 
+def _extract_logprob_payload(
+    logprobs_data: Optional[Dict[str, Any]],
+) -> tuple[List[float], List[Dict[str, float]]]:
+    """Extract compact per-output-token logprob payloads from vLLM data."""
+    if not logprobs_data:
+        return [], []
+
+    raw_logprobs = logprobs_data.get("token_logprobs") or []
+    output_logprobs = [float(item) for item in raw_logprobs if item is not None]
+
+    output_top_logprobs: List[Dict[str, float]] = []
+    for top_logprobs in logprobs_data.get("top_logprobs") or []:
+        if not top_logprobs:
+            output_top_logprobs.append({})
+            continue
+        output_top_logprobs.append(
+            {str(token): float(logprob) for token, logprob in top_logprobs.items()}
+        )
+
+    return output_logprobs, output_top_logprobs
+
+
 class TITOHandler:
     """Core request handler for TITO chat completions.
 
@@ -180,6 +202,8 @@ class TITOHandler:
         )
 
         try:
+            observation_token_ids: Optional[List[int]] = None
+
             # Tokenize input
             if turn == 0:
                 prompt_ids = await self._tokenizer.tokenize_messages(
@@ -188,6 +212,7 @@ class TITOHandler:
                 session.tokens = list(prompt_ids)
                 session.loss_mask = [0] * len(prompt_ids)
                 session.messages_seen = len(messages)
+                observation_token_ids = list(prompt_ids)
             else:
                 prev_seen = session.begin_turn()
                 new_messages = messages[prev_seen:]
@@ -220,6 +245,7 @@ class TITOHandler:
                             # Rebuild loss mask: preserve old mask, append 0s for new obs
                             new_obs_len = len(new_tokens) - len(session.tokens)
                             if new_obs_len >= 0:
+                                observation_token_ids = list(new_tokens[len(session.tokens):])
                                 session.tokens = list(new_tokens)
                                 session.loss_mask.extend([0] * new_obs_len)
                                 bridged = True
@@ -243,6 +269,7 @@ class TITOHandler:
                             old_len = min(len(session.loss_mask), len(full_ids))
                             new_mask = session.loss_mask[:old_len] + [0] * (len(full_ids) - old_len)
                             session.reset_from_full_render(full_ids, new_mask)
+                            observation_token_ids = None
                             bridged = True
                     else:
                         # Strategy 3: dummy-base delta (no renderer available)
@@ -250,6 +277,7 @@ class TITOHandler:
                             model, obs_messages, tools=tools,
                         )
                         session.append_prompt(delta_ids)
+                        observation_token_ids = list(delta_ids)
                         logger.debug(
                             f"session={session_id} turn={turn}: "
                             f"obs {len(obs_messages)} msgs → {len(delta_ids)} tokens "
@@ -303,6 +331,20 @@ class TITOHandler:
                         prompt_tokens=prompt_len,
                         completion_tokens=0,
                         finish_reason="length",
+                    )
+                    session.record_transition(
+                        step=turn,
+                        input_token_ids=full_prompt_ids,
+                        output_token_ids=[],
+                        output_logprobs=[],
+                        output_top_logprobs=[],
+                        output_text="",
+                        assistant_message={
+                            "role": "assistant",
+                            "reasoning_content": None,
+                            "content": "",
+                        },
+                        observation_token_ids=observation_token_ids,
                     )
                     return JSONResponse(content=response)
                 requested = completion_params.get("max_tokens", 2048)
@@ -365,6 +407,26 @@ class TITOHandler:
                 parsed = self._renderer_backend.parse_response(response_token_ids)
             else:
                 parsed = self._tool_parser.parse(response_text)
+
+            output_logprobs, output_top_logprobs = _extract_logprob_payload(completion_logprobs)
+            assistant_message: Dict[str, Any] = {
+                "role": "assistant",
+                "reasoning_content": None,
+                "content": parsed["content"] if parsed["content"] is not None else None,
+            }
+            if parsed["tool_calls"]:
+                assistant_message["tool_calls"] = parsed["tool_calls"]
+
+            session.record_transition(
+                step=turn,
+                input_token_ids=full_prompt_ids,
+                output_token_ids=response_token_ids,
+                output_logprobs=output_logprobs,
+                output_top_logprobs=output_top_logprobs,
+                output_text=response_text,
+                assistant_message=assistant_message,
+                observation_token_ids=observation_token_ids,
+            )
 
             # Prefix sanity check
             if self._config.prefix_check:
@@ -486,6 +548,7 @@ def _build_app(
         _file_handler.setFormatter(
             logging.Formatter("%(asctime)s %(levelname)s %(message)s")
         )
+        logger.setLevel(logging.DEBUG)
         logger.addHandler(_file_handler)
 
     # Shared HTTP client for connection pooling across all requests
@@ -543,7 +606,131 @@ def _build_app(
             return JSONResponse(
                 content={"error": f"session {session_id} not found"}, status_code=404
             )
-        return JSONResponse(content=session.to_dict())
+        try:
+            content = session.to_dict()
+        except ValueError as exc:
+            logger.exception("TITO transition validation failed for session=%s", session_id)
+            return JSONResponse(
+                content={"error": "transition validation failed", "detail": str(exc)},
+                status_code=500,
+            )
+        logger.info(
+            "TITO transition validation passed for session=%s transitions=%d tokens=%d",
+            session_id,
+            len(session.transitions),
+            len(session.tokens),
+        )
+        return JSONResponse(content=content)
+
+    @app.get("/session/{session_id}/transitions")
+    async def list_transitions(
+        session_id: str,
+        include_input_tokens: bool = False,
+        include_prefix_tree: bool = False,
+    ):
+        """Return compact transition records for a session."""
+        session = app.state.sessions.get(session_id)
+        if session is None:
+            return JSONResponse(
+                content={"error": f"session {session_id} not found"}, status_code=404
+            )
+
+        content: Dict[str, Any] = {
+            "session_id": session_id,
+            "num_transitions": len(session.transitions),
+            "transitions": [
+                transition.to_dict(include_input_tokens=include_input_tokens)
+                for transition in session.transitions
+            ],
+        }
+        if include_prefix_tree:
+            content["input_token_prefix_tree"] = session.input_token_store.to_dict()
+        return JSONResponse(content=content)
+
+    @app.get("/session/{session_id}/transition/by-prefix/{prefix_hash}")
+    async def get_transitions_by_prefix_hash(
+        session_id: str,
+        prefix_hash: str,
+        include_input_tokens: bool = False,
+    ):
+        """Return transitions whose input prompt has the given prefix hash."""
+        session = app.state.sessions.get(session_id)
+        if session is None:
+            return JSONResponse(
+                content={"error": f"session {session_id} not found"}, status_code=404
+            )
+
+        matches = [
+            transition
+            for transition in session.transitions
+            if transition.input_token_ids.prefix_hash == prefix_hash
+        ]
+        if not matches:
+            return JSONResponse(
+                content={"error": f"prefix hash {prefix_hash} not found"}, status_code=404
+            )
+
+        return JSONResponse(
+            content={
+                "session_id": session_id,
+                "input_prefix_hash": prefix_hash,
+                "num_matches": len(matches),
+                "transitions": [
+                    transition.to_dict(include_input_tokens=include_input_tokens)
+                    for transition in matches
+                ],
+            }
+        )
+
+    @app.get("/session/{session_id}/transition/{step}")
+    async def get_transition(
+        session_id: str,
+        step: int,
+        include_input_tokens: bool = False,
+    ):
+        """Return a single transition by step number."""
+        session = app.state.sessions.get(session_id)
+        if session is None:
+            return JSONResponse(
+                content={"error": f"session {session_id} not found"}, status_code=404
+            )
+
+        transition = next((item for item in session.transitions if item.step == step), None)
+        if transition is None:
+            return JSONResponse(
+                content={"error": f"transition step {step} not found"}, status_code=404
+            )
+        return JSONResponse(
+            content={
+                "session_id": session_id,
+                "transition": transition.to_dict(include_input_tokens=include_input_tokens),
+            }
+        )
+
+    @app.get("/session/{session_id}/prefix/{prefix_hash}")
+    async def get_prefix(session_id: str, prefix_hash: str):
+        """Materialize a token prefix by stable prefix hash."""
+        session = app.state.sessions.get(session_id)
+        if session is None:
+            return JSONResponse(
+                content={"error": f"session {session_id} not found"}, status_code=404
+            )
+
+        try:
+            input_token_ids = session.input_token_store.materialize_hash(prefix_hash)
+        except KeyError:
+            return JSONResponse(
+                content={"error": f"prefix hash {prefix_hash} not found"}, status_code=404
+            )
+
+        return JSONResponse(
+            content={
+                "session_id": session_id,
+                "prefix_hash": prefix_hash,
+                "input_token_len": len(input_token_ids),
+                "input_token_ids": input_token_ids,
+            }
+        )
 
     @app.delete("/session/{session_id}")
     async def delete_session(session_id: str):

@@ -7,5 +7,5 @@ and loss masks per session — eliminating training-side re-tokenization.
 
 from .config import TITOConfig  # noqa: F401
 from .proxy import TITOHandler, TITOProxyActor  # noqa: F401
-from .session import SessionState  # noqa: F401
+from .session import SessionState, TITOTransition, TokenPrefixStore, TokenSequenceRef  # noqa: F401
 from .tokenizer_backends import HttpTokenizerBackend, RendererTokenizerBackend, TokenizerBackend  # noqa: F401

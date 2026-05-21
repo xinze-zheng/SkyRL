@@ -8,7 +8,7 @@ import httpx
 import pytest
 
 from skyrl.backends.skyrl_train.inference_servers.tito.config import TITOConfig
-from skyrl.backends.skyrl_train.inference_servers.tito.proxy import TITOHandler, _check_prefix
+from skyrl.backends.skyrl_train.inference_servers.tito.proxy import TITOHandler, _build_app, _check_prefix
 from skyrl.backends.skyrl_train.inference_servers.tito.session import SessionState
 from skyrl.backends.skyrl_train.inference_servers.tito.tokenizer_backends import HttpTokenizerBackend
 
@@ -143,6 +143,18 @@ class TestTITOHandler:
         assert len(s.tokens) == 8
         assert s.loss_mask[:5] == [0, 0, 0, 0, 0]
         assert s.loss_mask[5:] == [1, 1, 1]
+        assert len(s.transitions) == 1
+        transition = s.transitions[0]
+        assert transition.step == 0
+        assert transition.input_token_ids.to_list() == [1, 2, 3, 4, 5, 100, 101]
+        assert transition.output_token_ids == [200, 201, 202]
+        assert transition.output_text == "Hello, I can help!"
+        assert transition.assistant_message == {
+            "role": "assistant",
+            "reasoning_content": None,
+            "content": "Hello, I can help!",
+        }
+        assert transition.observation_token_ids == [1, 2, 3, 4, 5]
 
     @pytest.mark.asyncio
     async def test_second_turn(self):
@@ -179,6 +191,12 @@ class TestTITOHandler:
         assert s.messages_seen == 4
         # prompt(5) + resp1(3) + delta(3) + resp2(3)
         assert len(s.tokens) == 14
+        assert len(s.transitions) == 2
+        assert s.transitions[1].step == 1
+        assert s.transitions[1].input_token_ids.to_list() == [
+            1, 2, 3, 4, 5, 200, 201, 202, 10, 11, 12, 100, 101,
+        ]
+        assert s.transitions[1].observation_token_ids == [10, 11, 12]
 
     @pytest.mark.asyncio
     async def test_tool_calls_parsed(self):
@@ -203,6 +221,35 @@ class TestTITOHandler:
         assert body["choices"][0]["message"]["tool_calls"] is not None
         assert len(body["choices"][0]["message"]["tool_calls"]) == 1
         assert body["choices"][0]["message"]["tool_calls"][0]["function"]["name"] == "bash"
+        assert sessions["s1"].transitions[0].assistant_message["tool_calls"] is not None
+
+    @pytest.mark.asyncio
+    async def test_transition_records_logprobs(self):
+        """Transition should capture completion logprobs when the backend returns them."""
+        completion_response = {
+            "choices": [{
+                "text": "ok",
+                "finish_reason": "stop",
+                "token_ids": [300, 301],
+                "logprobs": {
+                    "tokens": ["o", "k"],
+                    "token_logprobs": [-0.1, -0.2],
+                    "top_logprobs": [{"o": -0.1}, {"k": -0.2}],
+                },
+            }]
+        }
+        handler, sessions = self._make_handler(completion_response=completion_response)
+        req = {
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_tokens": 50,
+        }
+        resp = await handler.handle_chat_completion("s1", req)
+        assert resp.status_code == 200
+
+        transition = sessions["s1"].transitions[0]
+        assert transition.output_logprobs == [-0.1, -0.2]
+        assert transition.output_top_logprobs == [{"o": -0.1}, {"k": -0.2}]
 
     @pytest.mark.asyncio
     async def test_error_handling(self):
@@ -242,3 +289,117 @@ class TestTITOHandler:
         post_call = handler._client.post.call_args
         payload = post_call[1]["json"]
         assert payload["max_tokens"] == 256
+
+
+class TestTITOTransitionEndpoints:
+    """Tests for transition query endpoints."""
+
+    def _make_app_with_session(self):
+        app = _build_app("http://mock:8000", TITOConfig(prefix_check=False))
+        session = SessionState(model="m")
+        first = session.record_transition(
+            step=0,
+            input_token_ids=[1, 2, 3],
+            output_token_ids=[4, 5],
+            output_logprobs=[-0.1, -0.2],
+            output_top_logprobs=[{"4": -0.1}, {"5": -0.2}],
+            output_text="hello",
+            assistant_message={"role": "assistant", "content": "hello"},
+            observation_token_ids=[1, 2, 3],
+        )
+        second = session.record_transition(
+            step=1,
+            input_token_ids=[1, 2, 3, 4, 5, 6],
+            output_token_ids=[7],
+            output_logprobs=[-0.3],
+            output_top_logprobs=[{"7": -0.3}],
+            output_text="next",
+            assistant_message={"role": "assistant", "content": "next"},
+            observation_token_ids=[6],
+        )
+        app.state.sessions["s1"] = session
+        return app, first, second
+
+    @pytest.mark.asyncio
+    async def test_list_transitions_compact(self):
+        app, first, _ = self._make_app_with_session()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get("/session/s1/transitions")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["session_id"] == "s1"
+        assert body["num_transitions"] == 2
+        assert "input_token_prefix_tree" not in body
+        assert body["transitions"][0]["input_prefix_hash"] == first.input_token_ids.prefix_hash
+        assert "input_token_ids" not in body["transitions"][0]
+
+    @pytest.mark.asyncio
+    async def test_list_transitions_with_materialized_inputs_and_tree(self):
+        app, _, second = self._make_app_with_session()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get(
+                "/session/s1/transitions?include_input_tokens=true&include_prefix_tree=true"
+            )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert "input_token_prefix_tree" in body
+        assert body["transitions"][1]["input_token_ids"] == [1, 2, 3, 4, 5, 6]
+        assert body["transitions"][1]["input_prefix_hash"] == second.input_token_ids.prefix_hash
+
+    @pytest.mark.asyncio
+    async def test_get_transition_by_step(self):
+        app, _, _ = self._make_app_with_session()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get("/session/s1/transition/1?include_input_tokens=true")
+
+        assert resp.status_code == 200
+        transition = resp.json()["transition"]
+        assert transition["step"] == 1
+        assert transition["input_token_ids"] == [1, 2, 3, 4, 5, 6]
+        assert transition["output_token_ids"] == [7]
+
+    @pytest.mark.asyncio
+    async def test_get_transition_by_prefix_hash(self):
+        app, first, _ = self._make_app_with_session()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get(
+                f"/session/s1/transition/by-prefix/{first.input_token_ids.prefix_hash}"
+            )
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["input_prefix_hash"] == first.input_token_ids.prefix_hash
+        assert body["num_matches"] == 1
+        assert body["transitions"][0]["step"] == 0
+
+    @pytest.mark.asyncio
+    async def test_get_prefix_by_hash(self):
+        app, _, second = self._make_app_with_session()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            resp = await client.get(f"/session/s1/prefix/{second.input_token_ids.prefix_hash}")
+
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body["prefix_hash"] == second.input_token_ids.prefix_hash
+        assert body["input_token_len"] == 6
+        assert body["input_token_ids"] == [1, 2, 3, 4, 5, 6]
+
+    @pytest.mark.asyncio
+    async def test_transition_endpoint_missing_values(self):
+        app, _, _ = self._make_app_with_session()
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            missing_step = await client.get("/session/s1/transition/99")
+            missing_hash = await client.get("/session/s1/transition/by-prefix/sha256:missing")
+            missing_session = await client.get("/session/missing/transitions")
+
+        assert missing_step.status_code == 404
+        assert missing_hash.status_code == 404
+        assert missing_session.status_code == 404
