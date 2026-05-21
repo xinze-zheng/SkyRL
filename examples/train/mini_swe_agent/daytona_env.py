@@ -20,6 +20,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from minisweagent.exceptions import Submitted
+
 logger = logging.getLogger(__name__)
 
 
@@ -68,7 +70,11 @@ class DaytonaEnvironment:
         self._start_sandbox()
 
     def _start_sandbox(self):
-        """Create a Daytona sandbox from the configured image."""
+        """Create a Daytona sandbox from the configured image.
+
+        Uses a generous timeout for sandbox creation (10 min) to handle
+        initial Docker image pulls while preventing indefinite hangs.
+        """
         from daytona_sdk import Daytona, DaytonaConfig, CreateSandboxFromImageParams
 
         config = DaytonaConfig(
@@ -78,20 +84,28 @@ class DaytonaEnvironment:
         )
         self._daytona = Daytona(config=config)
 
-        sandbox_id = f"swe-{uuid.uuid4().hex[:8]}"
-        self.logger.debug(f"Creating Daytona sandbox {sandbox_id} from image {self.config.image}")
+        sandbox_name = f"swe-{uuid.uuid4().hex[:12]}"
+        self.logger.debug(f"Creating Daytona sandbox {sandbox_name} from image {self.config.image}")
 
         t0 = time.time()
         params = CreateSandboxFromImageParams(
             image=self.config.image,
             language="python",
+            name=sandbox_name,
         )
-        self._sandbox = self._daytona.create(params)
+        self._sandbox = self._daytona.create(params, timeout=self.config.pull_timeout)
         self._create_time = time.time() - t0
         self.logger.info(f"Created Daytona sandbox: {self._sandbox.id} ({self._create_time:.1f}s)")
 
     def execute(self, action: dict, cwd: str = "", *, timeout: int | None = None) -> Dict[str, Any]:
-        """Execute a command in the Daytona sandbox."""
+        """Execute a command in the Daytona sandbox.
+
+        After each successful execution, checks if the output starts with
+        ``COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT`` (the mini-swe-agent
+        submission marker).  If so, raises :class:`Submitted` so the agent
+        loop terminates and the diff is captured as the submission — matching
+        the behavior of the local Docker and Singularity environments.
+        """
         command = action.get("command", "")
         cwd = cwd or self.config.cwd
 
@@ -117,7 +131,10 @@ class DaytonaEnvironment:
                 "output_len": len(response.result),
                 "exit_code": response.exit_code,
             })
+            self._check_finished(result)
             return result
+        except Submitted:
+            raise
         except Exception as e:
             elapsed = time.time() - t0
             self.logger.error(f"Daytona exec error: {e}")
@@ -134,6 +151,26 @@ class DaytonaEnvironment:
                 "returncode": 1,
                 "exception_info": str(e),
             })
+
+    def _check_finished(self, output: dict):
+        """Raise :class:`Submitted` if the output contains the submission marker.
+
+        Matches the logic in ``minisweagent.environments.local.LocalEnvironment``.
+        """
+        lines = output.get("output", "").lstrip().splitlines(keepends=True)
+        if (
+            lines
+            and lines[0].strip() == "COMPLETE_TASK_AND_SUBMIT_FINAL_OUTPUT"
+            and output["returncode"] == 0
+        ):
+            submission = "".join(lines[1:])
+            raise Submitted(
+                {
+                    "role": "exit",
+                    "content": submission,
+                    "extra": {"exit_status": "Submitted", "submission": submission},
+                }
+            )
 
     def get_template_vars(self, **kwargs) -> Dict[str, Any]:
         """Return template variables for the agent."""

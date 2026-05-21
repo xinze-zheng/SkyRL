@@ -1,4 +1,5 @@
 import asyncio
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Any, Tuple
 import yaml
@@ -33,7 +34,8 @@ class MiniSWEGeneratorConfig(GeneratorConfig):
 
 
 class DefaultAgentWithReminder(DefaultAgent):
-    """Subclass that preserves raw assistant messages on FormatError.
+    """Subclass that preserves raw assistant messages on FormatError
+    and records per-turn timing (inference vs execution).
 
     In upstream mini-swe-agent, if the model's response fails action parsing
     (FormatError), the assistant message is never added to self.messages because
@@ -45,6 +47,7 @@ class DefaultAgentWithReminder(DefaultAgent):
     def __init__(self, model, env, **kwargs):
         super().__init__(model, env, **kwargs)
         self._patch_model_query()
+        self.turn_timings: List[Dict[str, Any]] = []
 
     def _patch_model_query(self):
         """Wrap model._query to stash the raw response before parsing."""
@@ -64,16 +67,33 @@ class DefaultAgentWithReminder(DefaultAgent):
     def step(self) -> list[dict]:
         from minisweagent.exceptions import FormatError
 
+        turn_idx = len(self.turn_timings)
+        timing: Dict[str, Any] = {"turn": turn_idx}
+
+        # Phase 1: inference (model query)
+        t_infer_start = time.time()
         try:
-            ret = super().step()
-            return ret
+            message = self.query()
+            timing["inference_s"] = round(time.time() - t_infer_start, 3)
         except FormatError as e:
+            timing["inference_s"] = round(time.time() - t_infer_start, 3)
+            timing["exec_s"] = 0.0
+            timing["error"] = "FormatError"
+            self.turn_timings.append(timing)
             # Preserve the raw assistant response that failed parsing
             raw_msg = getattr(self.model, '_last_raw_message', None)
             if raw_msg and not any(m is raw_msg for m in self.messages):
                 raw_msg.setdefault("extra", {})["format_error"] = True
                 self.add_messages(raw_msg)
             raise
+
+        # Phase 2: execution (sandbox command)
+        t_exec_start = time.time()
+        ret = self.execute_actions(message)
+        timing["exec_s"] = round(time.time() - t_exec_start, 3)
+
+        self.turn_timings.append(timing)
+        return ret
 
 
 @ray.remote(num_cpus=0.01)
@@ -114,8 +134,11 @@ def init_and_run(
     result = None
     reward = 0
     error = None
+    env_create_time = 0.0
+    rollout_t0 = time.time()
     try:
         env = get_sb_environment(sweagent_config, instance, data_source)
+        env_create_time = getattr(env, '_create_time', 0.0)
         agent = DefaultAgentWithReminder(model, env, **sweagent_config.get("agent", {}))
         # v2: agent.run() returns a dict with exit_status/submission keys
         run_result = agent.run(instance["problem_statement"])  # type: ignore[arg-type]
@@ -128,6 +151,22 @@ def init_and_run(
         error = str(e)
         extra_info = {"traceback": traceback.format_exc()}
     finally:
+        rollout_elapsed = time.time() - rollout_t0
+
+        # Collect per-turn timing breakdown from the agent
+        turn_timings = getattr(agent, 'turn_timings', []) if agent else []
+        total_inference_s = sum(t.get("inference_s", 0) for t in turn_timings)
+        total_exec_s = sum(t.get("exec_s", 0) for t in turn_timings)
+
+        rollout_timing = {
+            "rollout_total_s": round(rollout_elapsed, 3),
+            "env_create_s": round(env_create_time, 3),
+            "total_inference_s": round(total_inference_s, 3),
+            "total_exec_s": round(total_exec_s, 3),
+            "num_turns": len(turn_timings),
+            "turns": turn_timings,
+        }
+
         # Create trajectory directory with proper structure: step_{global_step}/{train/eval}
         path = Path(generator_cfg.miniswe_traj_dir) / f"step_{global_step}" / training_phase
         path.mkdir(parents=True, exist_ok=True)
@@ -150,7 +189,14 @@ def init_and_run(
                 eval_error = str(e)
                 error = str(e)
 
-            agent.save(path, {"exit_status": exit_status, "result": result, "extra_info": extra_info, "reward": reward, "eval_error": eval_error})
+            agent.save(path, {
+                "exit_status": exit_status,
+                "result": result,
+                "extra_info": extra_info,
+                "reward": reward,
+                "eval_error": eval_error,
+                "rollout_timing": rollout_timing,
+            })
 
     return (agent.messages if agent is not None else [], reward, error)
 
@@ -405,13 +451,47 @@ class MiniSweAgentGenerator(SkyRLGymGenerator):
 
         all_outputs = await asyncio.gather(*tasks)
 
-        # Filter out the `None` entries, which means that trajectory generation failed
-        responses = [output[0] for output in all_outputs if output[0] is not None]
-        rewards = [output[1] for output in all_outputs if output[0] is not None]
-        stop_reasons = [output[2] for output in all_outputs if output[0] is not None]
-        loss_masks = [output[3] for output in all_outputs if output[0] is not None]
-        prompt_token_ids = [output[4] for output in all_outputs if output[0] is not None]
-        if not len(responses):
+        # Build a minimal dummy for failed rollouts so prompt/response counts
+        # stay aligned (the validator requires 1:1 correspondence).  Failed
+        # rollouts produce a single EOS token with reward=0 and loss_mask=0.
+        eos_id = self.tokenizer.eos_token_id or 0
+        # Use the first successful prompt as a template for failed ones
+        fallback_prompt = None
+        for output in all_outputs:
+            if output[0] is not None and output[4] is not None:
+                fallback_prompt = output[4]
+                break
+        if fallback_prompt is None:
+            # All failed — use a minimal prompt
+            fallback_prompt = [eos_id]
+
+        responses = []
+        rewards = []
+        stop_reasons = []
+        loss_masks = []
+        prompt_token_ids = []
+        num_failed = 0
+        for output in all_outputs:
+            if output[0] is not None:
+                responses.append(output[0])
+                rewards.append(output[1])
+                stop_reasons.append(output[2])
+                loss_masks.append(output[3])
+                prompt_token_ids.append(output[4])
+            else:
+                num_failed += 1
+                responses.append([eos_id])
+                rewards.append(0.0)
+                stop_reasons.append("error")
+                loss_masks.append([0])
+                prompt_token_ids.append(fallback_prompt)
+
+        if num_failed:
+            from loguru import logger as _logger
+            _logger.warning(
+                f"Padded {num_failed}/{len(all_outputs)} failed rollouts with dummy zero-reward responses"
+            )
+        if not any(r is not None and r != [eos_id] for r in responses):
             raise ValueError(
                 "Found no valid responses for this step. This means that generation failed for all trajectories, likely due to errors in environment setup."
             )

@@ -13,7 +13,7 @@ set -x
 
 DATA_DIR="$HOME/data/swe_gym_subset"
 CKPT_PATH="$HOME/ckpts/llm_mini_swe_32B_daytona"
-MINISWE_TRAJ_DIR="$HOME/mini_swe_agent_trajs_32B_daytona_v2"
+MINISWE_TRAJ_DIR="$HOME/mini_swe_agent_trajs_32B_daytona_v3"
 
 NUM_GPUS=8
 NNODES=1
@@ -25,6 +25,13 @@ export OPENAI_API_KEY=dummy
 export LITELLM_MODEL_REGISTRY_PATH=examples/train/mini_swe_agent/litellm.json
 export MSWEA_COST_TRACKING=ignore_errors
 export DAYTONA_API_KEY=dtn_0d0ef7782e6b7f294f56bfbb6c94fa98c8af46b2e21f97e80e5dd49f7f05ef57
+
+# Ensure NCCL works for single-node B200 training.
+# Remove GIB network plugin (designed for multi-node) which breaks single-node NCCL.
+# NOTE: `unset` is critical — setting to empty string ("") does NOT work.
+unset NCCL_ENV_PLUGIN NCCL_CONF_FILE NCCL_NET NCCL_TUNER_PLUGIN NCCL_NET_PLUGIN
+export NCCL_IB_DISABLE=1
+export LD_LIBRARY_PATH="/usr/lib/x86_64-linux-gnu"
 
 set -a && source examples/train/mini_swe_agent/.env.miniswe && set +a
 python -m examples.train.mini_swe_agent.main_mini_swe \
@@ -76,10 +83,10 @@ python -m examples.train.mini_swe_agent.main_mini_swe \
   generator.inference_engine.engine_init_kwargs.max_model_len=40960 \
   trainer.logger="$LOGGER" \
   trainer.project_name="mini_swe_daytona_32B" \
-  trainer.run_name="qwen3_32B_daytona_v2_n4_t20" \
+  trainer.run_name="qwen3_32B_daytona_v3_n4_t20" \
   trainer.resume_mode=null \
   trainer.ckpt_path="$CKPT_PATH" \
-  generator.miniswe_config_path="examples/train/mini_swe_agent/swebench_daytona.yaml" \
+  generator.miniswe_config_path="examples/train/mini_swe_agent/swebench_daytona_v3.yaml" \
   generator.miniswe_traj_dir="$MINISWE_TRAJ_DIR" \
   generator.inference_engine.distributed_executor_backend=mp \
   generator.inference_engine.tito.enabled=true \

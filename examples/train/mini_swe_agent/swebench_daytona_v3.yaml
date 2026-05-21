@@ -111,9 +111,9 @@ environment:
     PIP_PROGRESS_BAR: 'off'
     TQDM_DISABLE: '1'
   environment_class: daytona
-  base_url: "http://149.165.172.183:3000/api"
+  base_url: "http://149.165.168.191:3000/api"
   target: "us"
-  metrics_dir: "/home/wxzheng/mini_swe_agent_trajs_32B_daytona_v2/daytona_metrics"
+  metrics_dir: "/home/wxzheng/mini_swe_agent_trajs_32B_daytona_v3/daytona_metrics"
 
 model:
   model_name: ""
